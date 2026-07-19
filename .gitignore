@@ -3,3 +3,11 @@ __pycache__/
 venv/
 *.sqlite3
 *.db
+
+pulse_demo.mp4
+ui/pulse-ui.exe
+.claude/
+pulse.egg-info/
+ui/node_modules/
+ui/src-tauri/target/
+scratch_demo*.py
