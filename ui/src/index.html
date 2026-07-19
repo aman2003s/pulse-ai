@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pulse</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="pill" class="idle" data-tauri-drag-region>
+    <button id="orb" aria-label="Wake Pulse and start listening" title="Click to wake Pulse (same as saying 'Pulse')"></button>
+    <div id="content" data-tauri-drag-region>
+      <div id="status-line" aria-live="polite">Connecting to Pulse…</div>
+      <div id="detail-line" aria-live="polite"></div>
+    </div>
+    <button id="settings-btn" aria-label="Settings" aria-haspopup="true" aria-expanded="false" title="Settings">⚙</button>
+
+    <div id="settings-menu" role="menu" hidden>
+      <div class="s-row">
+        <label for="wakeword-input">Wake word</label>
+        <input type="text" id="wakeword-input" maxlength="20" value="pulse" aria-label="Wake word" />
+      </div>
+      <button id="train-wake-btn" aria-label="Train wake word with your voice"
+              title="Records you saying the wake word 5 times, then retrains">Train wake word</button>
+    </div>
+  </div>
+
+  <div id="input-row">
+    <input id="text-input" type="text" placeholder="Type a command… (Esc cancels)"
+           aria-label="Type a command to Pulse" autocomplete="off" />
+  </div>
+
+  <div id="quick-row">
+    <label id="a11y-row" title="Guided feedback, window narration, and typing echo — all in one switch">
+      <input type="checkbox" id="a11y-chk" aria-label="Superhero Mode: guided feedback, narration, and typing echo" />
+      Superhero Mode
+    </label>
+    <select id="mode-select" aria-label="Feedback mode">
+      <option>Minimal</option>
+      <option selected>Standard</option>
+      <option>Guided</option>
+    </select>
+    <select id="mic-select" aria-label="Microphone"><option value="">Default mic</option></select>
+  </div>
+
+  <div id="toast" role="alert" hidden></div>
+
+  <script src="main.js"></script>
+</body>
+</html>

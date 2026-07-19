@@ -1,0 +1,10 @@
+openwakeword
+onnxruntime
+silero-vad
+sounddevice
+numpy
+kokoro
+faster-whisper
+websockets
+pydantic
+httpx
