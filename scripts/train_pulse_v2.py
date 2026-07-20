@@ -71,9 +71,17 @@ def positive_windows(feats, f_start, f_end):
 def all_windows(feats, step=2):
     return [feats[i:i + 16, :] for i in range(0, feats.shape[0] - 15, step)]
 
-print("Synthesizing clips...")
+import time
+t0 = time.time()
+
+def elapsed():
+    s = int(time.time() - t0)
+    return f"{s//60}m{s%60:02d}s"
+
+print(f"[{elapsed()}] Synthesising positive clips ({len(TRAIN_VOICES)} voices x 5 speeds)...")
 pos_raw, neg_raw = [], []  # (int16 buffer, f_start, f_end)
-for v in TRAIN_VOICES:
+for vi, v in enumerate(TRAIN_VOICES, 1):
+    print(f"  [{elapsed()}] voice {vi}/{len(TRAIN_VOICES)}: {v}")
     for speed in [0.8, 0.9, 1.0, 1.1, 1.25]:
         for text in [WAKE_WORD, WAKE_WORD + "."]:
             base = synth(text, v, speed)
@@ -81,23 +89,25 @@ for v in TRAIN_VOICES:
                 pos_raw.append(place(augment(base)))
 
 # user-recorded real samples — weighted heavily (40x each)
-# Real recordings are the ground truth: they capture YOUR voice, YOUR mic, YOUR room.
-# The more weight we give them relative to synthetic clips, the more personal the model.
 import glob
 import scipy.io.wavfile as wf
-user_wavs = glob.glob(os.path.join(MODELS_DIR, 'user_samples', '*.wav'))
-USER_WEIGHT = 40  # Each real sample produces this many augmented variants
-for w in user_wavs:
+user_wavs = [w for w in glob.glob(os.path.join(MODELS_DIR, 'user_samples', '*.wav'))
+             if not os.path.basename(w).startswith('_')]
+USER_WEIGHT = 40
+print(f"[{elapsed()}] Loading {len(user_wavs)} user voice samples (x{USER_WEIGHT} augmentations each)...")
+for wi, w in enumerate(user_wavs, 1):
     sr, a = wf.read(w)
     a = a.astype(np.float32) / 32767.0
-    # trim leading/trailing silence (simple energy gate)
     e = np.abs(a) > 0.02
     if e.any():
         a = a[max(np.argmax(e) - 800, 0):len(a) - np.argmax(e[::-1]) + 800]
     for _ in range(USER_WEIGHT):
         pos_raw.append(place(augment(a)))
-print(f"user samples: {len(user_wavs)} x{USER_WEIGHT} augmentations each")
-for v in TRAIN_VOICES[::2]:
+    print(f"  [{elapsed()}] user sample {wi}/{len(user_wavs)}: {os.path.basename(w)}")
+
+print(f"[{elapsed()}] Synthesising negative clips ({len(TRAIN_VOICES[::2])} voices x {len(NEG_WORDS)} words)...")
+for vi, v in enumerate(TRAIN_VOICES[::2], 1):
+    print(f"  [{elapsed()}] neg voice {vi}/{len(TRAIN_VOICES[::2])}: {v}")
     for w in NEG_WORDS:
         base = synth(w, v, 1.0)
         neg_raw.append(place(augment(base)))
@@ -105,8 +115,9 @@ for v in TRAIN_VOICES[::2]:
 for _ in range(40):
     lvl = rng.uniform(0.0, 0.05)
     neg_raw.append(((rng.normal(0, lvl, CLIP_LEN) * 32767).clip(-32767, 32767).astype(np.int16), 0, 0))
+print(f"[{elapsed()}] Synthesis done — pos={len(pos_raw)} neg={len(neg_raw)}")
 
-print(f"pos={len(pos_raw)} neg={len(neg_raw)}; extracting features...")
+print(f"[{elapsed()}] Extracting audio features (this can take 1-2 min)...")
 F = AudioFeatures(device='cpu', ncpu=4)
 pos_feats = F.embed_clips(np.array([b for b, _, _ in pos_raw]), batch_size=32)
 neg_feats = F.embed_clips(np.array([b for b, _, _ in neg_raw]), batch_size=32)
@@ -157,20 +168,20 @@ def run_training(lr=0.001, epochs=120):
         if avg < best_loss:
             best_loss = avg
             best_state = {k: v.clone() for k, v in m.model.state_dict().items()}
-        if epoch % 20 == 0:
-            print(f"  epoch {epoch:3d}  loss {avg:.4f}  best {best_loss:.4f}")
+        if epoch % 10 == 0:
+            print(f"  [{elapsed()}] epoch {epoch:3d}/{epochs}  loss {avg:.4f}  best {best_loss:.4f}")
 
     # restore best checkpoint found during training
     m.model.load_state_dict(best_state)
-    print(f"Restored best checkpoint (loss={best_loss:.4f})")
+    print(f"[{elapsed()}] Restored best checkpoint (loss={best_loss:.4f})")
     return m
 
-print("Training (pass 1)...")
+print(f"[{elapsed()}] Training (pass 1) — 120 epochs...")
 model = run_training(lr=0.001, epochs=120)
 
 out = os.path.join(MODELS_DIR, 'pulse_v2.onnx')
 model.export_to_onnx(out, class_mapping="pulse")
-print(f"exported {out}")
+print(f"[{elapsed()}] Exported -> {out}")
 
 # ---- validation on held-out voices (streaming, like the live listener) ----
 from openwakeword.model import Model as OWWModel

@@ -272,15 +272,16 @@ class VoiceController:
         # the loop, immediately followed by a redundant "Typed into Text editor" from
         # this second pass over the same result) which read as a confusing interruption.
 
-        if plan_steps and not getattr(self, "_pending_question", False):
-            # A real task actually ran and nothing is waiting on the user — invite a
-            # follow-up without requiring the wake word again.
+        # The constant "What would you like me to do now?" follow-up is specifically an
+        # accessibility feature (continuous feedback for a blind user who can't glance
+        # at the screen to know they're done) — it's Superhero Mode only. In normal
+        # mode a completed task just completes, silently. A REQUIRED clarifying question
+        # (e.g. "what should I name the file, and where?") is a different thing — that's
+        # about correctness, not chattiness, and fires in every mode via _pending_question.
+        superhero = self.feedback_mode == "Guided"
+        if plan_steps and not getattr(self, "_pending_question", False) and superhero:
             self._followup_or_idle()
         else:
-            # Either nothing ran, or the last thing said was itself a question (e.g.
-            # "Which one would you like to open?") — that already invites a reply;
-            # asking "what now?" on top of it would be a collision. The user's next
-            # utterance (via wake word) will naturally answer the pending question.
             self.broadcast_state("idle")
 
     def _run_task_loop(self, task_id, goal, system_prompt, max_iterations=6):
@@ -530,20 +531,45 @@ class VoiceController:
             f.write(word)
         self.tts.speak("Thank you. Training now. This takes about ten minutes. I'll tell you when it's done. You can keep using Pulse meanwhile.")
         self.broadcast_state("idle")
+        # broadcast a special training state so the UI can show a progress indicator
+        asyncio.run_coroutine_threadsafe(
+            self.ws_server.broadcast({"v": 1, "type": "training_progress",
+                                      "status": "started", "text": "Training started…"}),
+            self.loop
+        )
 
         for f in ('pulse_v2.onnx', 'pulse_v2.onnx.data'):
             p = os.path.join(root, 'models', f)
             if os.path.exists(p):
                 os.remove(p)
         env = dict(os.environ, PYTHONUTF8='1', PULSE_WAKE_WORD=word)
-        r = subprocess.run([sys.executable, os.path.join(root, 'scripts', 'train_pulse_v2.py')],
-                           capture_output=True, text=True, env=env, cwd=root)
-        if 'exported' not in r.stdout:
-            print("Wake training failed:", r.stdout[-500:], r.stderr[-500:])
-            self.broadcast_state("speaking")
-            self.tts.speak("Training didn't finish successfully. Your current wake word is unchanged.")
-            self.broadcast_state("idle")
-            return
+        proc = subprocess.Popen(
+            [sys.executable, os.path.join(root, 'scripts', 'train_pulse_v2.py')],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=env, cwd=root, bufsize=1
+        )
+        stdout_lines = []
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip()
+            if not line:
+                continue
+            stdout_lines.append(line)
+            print(line)  # still visible in the console
+            # forward each progress line to the UI
+            asyncio.run_coroutine_threadsafe(
+                self.ws_server.broadcast({"v": 1, "type": "training_progress",
+                                          "status": "running", "text": line}),
+                self.loop
+            )
+        proc.wait()
+        full_output = "\n".join(stdout_lines)
+        if 'Exported' not in full_output and 'exported' not in full_output:
+            print("Wake training failed output:", full_output[-500:])
+            asyncio.run_coroutine_threadsafe(
+                self.ws_server.broadcast({"v": 1, "type": "training_progress",
+                                          "status": "failed", "text": "Training failed — model unchanged"}),
+                self.loop
+            )
         try:
             self.listener.stop()
             self.listener.owwModel = None
@@ -566,10 +592,20 @@ class VoiceController:
                 conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('wake_word', ?)", (word,))
             self.broadcast_state("speaking")
             self.tts.speak(f"Done. {word} is now your trained wake word.")
+            asyncio.run_coroutine_threadsafe(
+                self.ws_server.broadcast({"v": 1, "type": "training_progress",
+                                          "status": "done", "text": f"✓ Wake word trained: {word}"}),
+                self.loop
+            )
         except Exception as e:
             print("Wake model swap failed:", e)
             self.broadcast_state("speaking")
             self.tts.speak("I trained the model but couldn't activate it live. It will be active after the next restart.")
+            asyncio.run_coroutine_threadsafe(
+                self.ws_server.broadcast({"v": 1, "type": "training_progress",
+                                          "status": "done", "text": "Restart to activate new model"}),
+                self.loop
+            )
         self.broadcast_state("idle")
 
     def _narration_loop(self):

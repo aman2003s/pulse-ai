@@ -91,6 +91,19 @@ function connect() {
         modeSelect.value = msg.feedback_mode || "Standard";
         a11yChk.checked = msg.feedback_mode === "Guided" && !!msg.narrate && !!msg.typing_echo;
         break;
+      case "training_progress": {
+        const bar = document.getElementById("train-bar");
+        if (msg.status === "started" || msg.status === "running") {
+          bar.hidden = false;
+          bar.textContent = msg.text;
+        } else {
+          // done or failed — show final message then fade out
+          bar.textContent = msg.text;
+          bar.dataset.status = msg.status;
+          setTimeout(() => { bar.hidden = true; bar.dataset.status = ""; }, 6000);
+        }
+        break;
+      }
     }
   };
 

@@ -208,3 +208,43 @@ body {
   #status-line { color: #fff; }
   #detail-line { color: #ddd; }
 }
+
+/* ---- training progress bar ---- */
+/* Slim strip that appears just above the pill only while training is running.
+   Hidden by default [hidden attr]. Zero layout shift — it's fixed-position. */
+#train-bar {
+  position: fixed;
+  bottom: calc(100% - 28px); /* sits just above the quick-row */
+  left: 50%;
+  transform: translateX(-50%);
+  width: 90%;
+  padding: 5px 14px;
+  border-radius: 10px;
+  background: rgba(16, 20, 36, 0.88);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(167, 139, 250, 0.35);
+  color: rgba(167, 139, 250, 0.95);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: center;
+  /* subtle pulsing left border to signal activity */
+  animation: train-pulse 2s ease-in-out infinite;
+  z-index: 20;
+}
+#train-bar[data-status="done"] {
+  border-color: rgba(52, 211, 153, 0.5);
+  color: rgba(52, 211, 153, 0.95);
+  animation: none;
+}
+#train-bar[data-status="failed"] {
+  border-color: rgba(239, 68, 68, 0.5);
+  color: rgba(239, 68, 68, 0.9);
+  animation: none;
+}
+@keyframes train-pulse {
+  0%, 100% { border-color: rgba(167, 139, 250, 0.25); }
+  50%       { border-color: rgba(167, 139, 250, 0.65); }
+}
