@@ -20,7 +20,10 @@ class CapturePipeline:
             model='silero_vad',
             force_reload=False
         )
-        self.earcon_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'models', 'ack.wav'))
+        # Prefer pre-baked asset (generate_assets.py), fall back to legacy Kokoro-generated ack.wav
+        assets_ack = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'models', 'assets', 'ack.wav'))
+        legacy_ack = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'models', 'ack.wav'))
+        self.earcon_path = assets_ack if os.path.exists(assets_ack) else legacy_ack
         self._abort = threading.Event()
 
     def cancel_capture(self):

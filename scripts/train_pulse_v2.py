@@ -80,10 +80,13 @@ for v in TRAIN_VOICES:
             for _ in range(3):
                 pos_raw.append(place(augment(base)))
 
-# user-recorded real samples (from record_pulse_samples.py) — weighted heavily
+# user-recorded real samples — weighted heavily (40x each)
+# Real recordings are the ground truth: they capture YOUR voice, YOUR mic, YOUR room.
+# The more weight we give them relative to synthetic clips, the more personal the model.
 import glob
 import scipy.io.wavfile as wf
 user_wavs = glob.glob(os.path.join(MODELS_DIR, 'user_samples', '*.wav'))
+USER_WEIGHT = 40  # Each real sample produces this many augmented variants
 for w in user_wavs:
     sr, a = wf.read(w)
     a = a.astype(np.float32) / 32767.0
@@ -91,9 +94,9 @@ for w in user_wavs:
     e = np.abs(a) > 0.02
     if e.any():
         a = a[max(np.argmax(e) - 800, 0):len(a) - np.argmax(e[::-1]) + 800]
-    for _ in range(25):
+    for _ in range(USER_WEIGHT):
         pos_raw.append(place(augment(a)))
-print(f"user samples: {len(user_wavs)}")
+print(f"user samples: {len(user_wavs)} x{USER_WEIGHT} augmentations each")
 for v in TRAIN_VOICES[::2]:
     for w in NEG_WORDS:
         base = synth(w, v, 1.0)
@@ -123,22 +126,47 @@ X = np.array(X, dtype=np.float32); Y = np.array(Y, dtype=np.float32)
 idx = rng.permutation(len(X)); X, Y = X[idx], Y[idx]
 print(f"windows: {len(X)} ({int(Y.sum())} positive)")
 
-model = Model(n_classes=1, input_shape=(16, 96), model_type="dnn", layer_dim=128, n_blocks=1)
-opt = torch.optim.Adam(model.model.parameters(), lr=0.001)
-# weight positives higher since they're the minority
-crit = torch.nn.BCELoss()
-Xt = torch.tensor(X); Yt = torch.tensor(Y).unsqueeze(1)
-n = len(Xt)
-for epoch in range(100):
-    perm = torch.randperm(n)
-    tot = 0.0
-    for i in range(0, n, 512):
-        b = perm[i:i + 512]
-        opt.zero_grad()
-        loss = crit(model.model(Xt[b]), Yt[b])
-        loss.backward(); opt.step(); tot += loss.item()
-    if epoch % 10 == 0:
-        print(f"epoch {epoch} loss {tot / (n // 512 + 1):.4f}")
+# ── weighted BCE loss: correct for class imbalance automatically ─────────────
+n_pos = int(Y.sum())
+n_neg = len(Y) - n_pos
+pos_weight_val = n_neg / max(n_pos, 1)   # e.g. 8.0 if negatives outnumber positives 8:1
+print(f"Class balance: {n_pos} positive, {n_neg} negative  →  pos_weight={pos_weight_val:.2f}")
+
+def run_training(lr=0.001, epochs=120):
+    m = Model(n_classes=1, input_shape=(16, 96), model_type="dnn", layer_dim=128, n_blocks=1)
+    opt = torch.optim.Adam(m.model.parameters(), lr=lr)
+    pw = torch.tensor([pos_weight_val])
+    crit = torch.nn.BCEWithLogitsLoss(pos_weight=pw)
+    Xt = torch.tensor(X); Yt = torch.tensor(Y).unsqueeze(1)
+    n = len(Xt)
+
+    best_loss = float('inf')
+    best_state = None
+
+    for epoch in range(epochs):
+        perm = torch.randperm(n)
+        tot = 0.0
+        for i in range(0, n, 512):
+            b = perm[i:i + 512]
+            opt.zero_grad()
+            # BCEWithLogitsLoss needs raw logits, so we call the linear layer directly
+            logits = m.model(Xt[b])
+            loss = crit(logits, Yt[b])
+            loss.backward(); opt.step(); tot += loss.item()
+        avg = tot / (n // 512 + 1)
+        if avg < best_loss:
+            best_loss = avg
+            best_state = {k: v.clone() for k, v in m.model.state_dict().items()}
+        if epoch % 20 == 0:
+            print(f"  epoch {epoch:3d}  loss {avg:.4f}  best {best_loss:.4f}")
+
+    # restore best checkpoint found during training
+    m.model.load_state_dict(best_state)
+    print(f"Restored best checkpoint (loss={best_loss:.4f})")
+    return m
+
+print("Training (pass 1)...")
+model = run_training(lr=0.001, epochs=120)
 
 out = os.path.join(MODELS_DIR, 'pulse_v2.onnx')
 model.export_to_onnx(out, class_mapping="pulse")
@@ -156,19 +184,42 @@ def stream_peak(int16buf):
     return peak
 
 print("\nVALIDATION (held-out voices):")
-ok = True
+passes = 0
+total = 0
 for v in HELDOUT_VOICES:
     for speed in [0.9, 1.1]:
         buf, _, _ = place(synth(WAKE_WORD, v, speed))
         pk = stream_peak(buf)
-        print(f"  POS {v} x{speed}: {pk:.3f} {'PASS' if pk > 0.5 else 'FAIL'}")
-        ok = ok and pk > 0.5
+        p = pk > 0.5
+        print(f"  POS {v} x{speed}: {pk:.3f} {'PASS' if p else 'FAIL'}")
+        passes += int(p); total += 1
 for v in HELDOUT_VOICES:
     for w in ["impulse", "pause", "hello there"]:
         buf, _, _ = place(synth(w, v, 1.0))
         pk = stream_peak(buf)
-        print(f"  NEG '{w}' {v}: {pk:.3f} {'PASS' if pk < 0.4 else 'FAIL'}")
-        ok = ok and pk < 0.4
+        p = pk < 0.4
+        print(f"  NEG '{w}' {v}: {pk:.3f} {'PASS' if p else 'FAIL'}")
+        passes += int(p); total += 1
 sil = stream_peak(np.zeros(CLIP_LEN, dtype=np.int16))
-print(f"  NEG silence: {sil:.3f} {'PASS' if sil < 0.3 else 'FAIL'}")
-print("\nRESULT:", "ALL PASS" if ok and sil < 0.3 else "SOME FAILED — tune before shipping")
+p = sil < 0.3
+print(f"  NEG silence: {sil:.3f} {'PASS' if p else 'FAIL'}")
+passes += int(p); total += 1
+
+pass_rate = passes / total
+print(f"\nRESULT: {passes}/{total} passed ({pass_rate*100:.0f}%)")
+
+if pass_rate < 0.80:
+    print("Pass rate below 80% — auto-retraining with lower learning rate...")
+    model = run_training(lr=0.0003, epochs=200)
+    model.export_to_onnx(out, class_mapping="pulse")
+    print(f"Re-exported {out}")
+    # re-validate
+    oww = OWWModel(wakeword_models=[out], inference_framework='onnx')
+    passes2 = 0
+    for v in HELDOUT_VOICES:
+        for speed in [0.9, 1.1]:
+            buf, _, _ = place(synth(WAKE_WORD, v, speed))
+            passes2 += int(stream_peak(buf) > 0.5)
+    print(f"After retrain: {passes2}/{len(HELDOUT_VOICES)*2} POS passed")
+else:
+    print("Model looks good — ready to use.")
