@@ -1,154 +1,122 @@
 """
 Generate all static audio assets used by the Pulse training flow.
 
-This runs ONCE (or after updates) and produces pre-baked WAV files in
-models/assets/ that are committed to the repo. Nothing in the training
-or recording scripts will ever call TTS or AI at runtime.
+This runs ONCE and produces pre-baked WAV files in models/assets/.
+Spoken prompts are synthesised using Kokoro (same voice as the whole app)
+so the training experience is 100% consistent with the live assistant.
+Nothing in the recording or training scripts ever calls TTS at runtime.
 
 Assets generated:
   models/assets/beep_start.wav   — 440 Hz tone (180ms)  "start recording"
-  models/assets/beep_ok.wav      — ascending 880→1047 Hz "sample accepted"
-  models/assets/beep_bad.wav     — descending 660→440 Hz "sample rejected"
-  models/assets/prompt_say.wav   — spoken "Say pulse now" (pre-recorded text)
-  models/assets/prompt_again.wav — spoken "Again, say pulse" 
-  models/assets/prompt_done.wav  — spoken "Training samples collected"
-  models/assets/ack.wav          — wake ack tone (two quick beeps, replaces Kokoro ack)
+  models/assets/beep_ok.wav      — ascending 880->1047 Hz "sample accepted"
+  models/assets/beep_bad.wav     — descending 660->440 Hz "sample rejected"
+  models/assets/ack.wav          — two quick beeps (live-app wake ack)
+  models/assets/prompt_say.wav   — Kokoro: "Say pulse now"
+  models/assets/prompt_again.wav — Kokoro: "Again, say pulse"
+  models/assets/prompt_done.wav  — Kokoro: "Training complete. All samples collected."
 
-Run:
+Run once (or whenever prompts need refreshing):
   venv\\Scripts\\python.exe scripts\\generate_assets.py
 """
 import os
+import shutil
 import numpy as np
 import scipy.io.wavfile as wf
+import scipy.signal
+import soundfile as sf
 
-ASSETS = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'models', 'assets'))
+# ── paths ─────────────────────────────────────────────────────────────────────
+ROOT   = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+ASSETS = os.path.join(ROOT, 'models', 'assets')
 os.makedirs(ASSETS, exist_ok=True)
 
-SR = 16000  # all assets at 16kHz so sounddevice never needs to switch rates
+SR = 16000  # all assets at 16 kHz — sounddevice never needs to switch rates
 
 
-def sine(freq, duration_s, sr=SR, amplitude=0.6):
-    t = np.linspace(0, duration_s, int(sr * duration_s), endpoint=False)
+# ── pure-math helpers ─────────────────────────────────────────────────────────
+def sine(freq, duration_s, amplitude=0.6):
+    t = np.linspace(0, duration_s, int(SR * duration_s), endpoint=False)
     return (np.sin(2 * np.pi * freq * t) * amplitude).astype(np.float32)
 
 
-def fade(audio, fade_ms=10, sr=SR):
-    """Apply linear fade-in and fade-out to avoid clicks."""
-    n = int(sr * fade_ms / 1000)
+def fade(audio, fade_ms=10):
+    n = int(SR * fade_ms / 1000)
     ramp = np.linspace(0, 1, n)
     out = audio.copy()
-    out[:n] *= ramp
+    out[:n]  *= ramp
     out[-n:] *= ramp[::-1]
     return out
 
 
-def save(name, audio, sr=SR):
+def gap(duration_s):
+    return np.zeros(int(SR * duration_s), dtype=np.float32)
+
+
+def save_pcm(name, audio_f32):
     path = os.path.join(ASSETS, name)
-    pcm = (np.clip(audio, -1, 1) * 32767).astype(np.int16)
-    wf.write(path, sr, pcm)
-    print(f"  wrote {path}  ({len(audio)/sr*1000:.0f} ms)")
+    pcm = (np.clip(audio_f32, -1, 1) * 32767).astype(np.int16)
+    wf.write(path, SR, pcm)
+    print(f"  wrote  {path}  ({len(audio_f32) / SR * 1000:.0f} ms)")
 
 
-def silence(duration_s, sr=SR):
-    return np.zeros(int(sr * duration_s), dtype=np.float32)
+# ── 1. Beep tones (pure math, instant) ───────────────────────────────────────
+print("Generating beep tones...")
 
+save_pcm("beep_start.wav", fade(sine(440, 0.18)))
 
-# ── beep_start.wav ────────────────────────────────────────────────────────────
-# Single 440 Hz tone, 180 ms — "get ready to speak"
-beep_start = fade(sine(440, 0.18))
-save("beep_start.wav", beep_start)
-
-# ── beep_ok.wav ───────────────────────────────────────────────────────────────
-# Ascending two-tone: 880 Hz → 1047 Hz (musical interval, positive feel)
-beep_ok = np.concatenate([
-    fade(sine(880, 0.12)),
-    silence(0.03),
+save_pcm("beep_ok.wav", np.concatenate([
+    fade(sine(880,  0.12)), gap(0.03),
     fade(sine(1047, 0.15)),
-])
-save("beep_ok.wav", beep_ok)
+]))
 
-# ── beep_bad.wav ──────────────────────────────────────────────────────────────
-# Descending two-tone: 660 Hz → 440 Hz (negative feel, "try again")
-beep_bad = np.concatenate([
-    fade(sine(660, 0.12)),
-    silence(0.03),
+save_pcm("beep_bad.wav", np.concatenate([
+    fade(sine(660, 0.12)), gap(0.03),
     fade(sine(440, 0.15)),
-])
-save("beep_bad.wav", beep_bad)
+]))
 
-# ── ack.wav ───────────────────────────────────────────────────────────────────
-# Two quick high beeps — the main-app "I heard you" acknowledgement.
-# Replaces the Kokoro-generated ack so the live app has no TTS startup lag.
-ack = np.concatenate([
+# Live-app wake acknowledgement — two crisp high beeps
+save_pcm("ack.wav", np.concatenate([
+    fade(sine(1047, 0.08)), gap(0.05),
     fade(sine(1047, 0.08)),
-    silence(0.05),
-    fade(sine(1047, 0.08)),
-])
-save("ack.wav", ack)
+]))
 
-# ── prompt_say.wav ────────────────────────────────────────────────────────────
-# "Say pulse now" — uses pyttsx3 (offline TTS, ships with Windows/macOS/Linux,
-# no model download required) if available; otherwise falls back to a
-# pre-synthesised melody pattern that is still clearly distinct from the beeps.
-def make_spoken_prompt(text, filename):
-    """Try pyttsx3 (offline, zero-download TTS). Falls back to a pattern tone."""
-    try:
-        import pyttsx3, tempfile, soundfile as sf
-        engine = pyttsx3.init()
-        engine.setProperty('rate', 140)
-        engine.setProperty('volume', 0.95)
-        tmp = tempfile.mktemp(suffix=".wav")
-        engine.save_to_file(text, tmp)
-        engine.runAndWait()
-        data, sr_in = sf.read(tmp)
-        os.unlink(tmp)
-        if sr_in != SR:
-            import scipy.signal
-            data = scipy.signal.resample_poly(
-                data.astype(np.float32),
-                SR, sr_in
-            )
-        save(filename, data.astype(np.float32))
-        return True
-    except Exception as e:
-        print(f"  pyttsx3 unavailable ({e}), using tone pattern for {filename}")
-        return False
 
-spoken_ok = make_spoken_prompt("Say pulse now", "prompt_say.wav")
-if not spoken_ok:
-    # Fallback: three rising tones that clearly mean "your turn"
-    fallback = np.concatenate([
-        fade(sine(523, 0.10)), silence(0.04),   # C5
-        fade(sine(659, 0.10)), silence(0.04),   # E5
-        fade(sine(784, 0.14)),                   # G5
-    ])
-    save("prompt_say.wav", fallback)
+# ── 2. Spoken prompts via Kokoro (same voice as rest of app) ─────────────────
+print("\nLoading Kokoro TTS (same voice used throughout the app)...")
+from kokoro import KPipeline
 
-spoken_ok = make_spoken_prompt("Again, say pulse", "prompt_again.wav")
-if not spoken_ok:
-    fallback = np.concatenate([
-        fade(sine(440, 0.10)), silence(0.04),
-        fade(sine(523, 0.10)), silence(0.04),
-        fade(sine(659, 0.14)),
-    ])
-    save("prompt_again.wav", fallback)
+pipeline = KPipeline(lang_code='a')
+VOICE = 'af_heart'   # must match TTSService default in core/voice/tts.py
+SPEED = 1.0
 
-spoken_ok = make_spoken_prompt("Training complete. All samples collected.", "prompt_done.wav")
-if not spoken_ok:
-    # Long ascending arpeggio — celebratory finish
-    fallback = np.concatenate([
-        fade(sine(523, 0.10)), silence(0.03),
-        fade(sine(659, 0.10)), silence(0.03),
-        fade(sine(784, 0.10)), silence(0.03),
-        fade(sine(1047, 0.20)),
-    ])
-    save("prompt_done.wav", fallback)
 
-# ── Copy ack.wav to models/ack.wav for backward compat with capture.py ────────
-import shutil
+def kokoro_to_wav(text, filename):
+    """Synthesise `text` with Kokoro, resample to 16 kHz, save as asset."""
+    # Kokoro outputs at 24 kHz
+    chunks = [audio for _, _, audio in pipeline(text, voice=VOICE, speed=SPEED)]
+    audio_24k = np.concatenate(chunks).astype(np.float32)
+
+    # Resample 24000 -> 16000 (ratio 2/3)
+    audio_16k = scipy.signal.resample_poly(audio_24k, up=2, down=3).astype(np.float32)
+
+    save_pcm(filename, audio_16k)
+
+
+print("Synthesising spoken prompts with Kokoro...")
+kokoro_to_wav("Say pulse now.",
+              "prompt_say.wav")
+
+kokoro_to_wav("Again, say pulse.",
+              "prompt_again.wav")
+
+kokoro_to_wav("Training complete. All samples collected.",
+              "prompt_done.wav")
+
+
+# ── 3. Copy ack.wav to models/ack.wav for backward compat with capture.py ─────
 src = os.path.join(ASSETS, "ack.wav")
-dst = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'models', 'ack.wav'))
+dst = os.path.join(ROOT, "models", "ack.wav")
 shutil.copy2(src, dst)
-print(f"  also wrote {dst} (capture.py compat)")
+print(f"\n  also copied -> {dst}  (capture.py backward compat)")
 
-print("\nAll assets generated. Commit models/assets/ to the repo.")
+print("\nDone. All assets are pre-baked — no AI runs during training or recording.")
