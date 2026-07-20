@@ -168,8 +168,10 @@ def ensure_single_instance():
         s.listen(1)
         return s  # keep alive for process lifetime — releasing it releases the lock
     except OSError:
-        print("Pulse is already running. Not starting a second instance.")
-        sys.exit(1)
+        # Already running — silently exit. No popup: the UI will just connect to
+        # the existing backend on its own reconnect loop.
+        print("Pulse is already running. Exiting silently.")
+        sys.exit(0)
 
 if __name__ == "__main__":
     lock_fd = ensure_single_instance()

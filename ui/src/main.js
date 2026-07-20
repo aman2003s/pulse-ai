@@ -21,7 +21,9 @@ const STATE_LABELS = {
 };
 
 let ws = null;
-let reconnectDelay = 1000;
+let reconnectDelay = 500;   // start fast — backend usually ready in 3-8s
+let reconnectAttempts = 0;  // track how many times we've tried
+const FAST_RETRY_LIMIT = 20; // try every 500ms for up to 10s before slowing down
 let fadeTimer = null;
 
 function setState(state) {
@@ -50,7 +52,8 @@ function connect() {
   ws = new WebSocket(WS_URL);
 
   ws.onopen = () => {
-    reconnectDelay = 1000;
+    reconnectDelay = 500;    // reset for next time
+    reconnectAttempts = 0;  // reset attempt counter
     setState("idle");
     detailLine.textContent = "";
     send({ type: "list_devices" });
@@ -109,10 +112,18 @@ function connect() {
 
   ws.onclose = () => {
     pill.className = "disconnected";
-    statusLine.textContent = "Pulse core not running";
-    detailLine.textContent = "Retrying…";
+    if (reconnectAttempts < FAST_RETRY_LIMIT) {
+      // Still in startup window — show a gentle "starting" message, not an error
+      statusLine.textContent = "Starting up…";
+      detailLine.textContent = `Connecting to Pulse core…`;
+      reconnectDelay = 500;
+    } else {
+      statusLine.textContent = "Pulse core not running";
+      detailLine.textContent = "Start run.bat to launch Pulse";
+      reconnectDelay = Math.min(reconnectDelay * 2, 5000);
+    }
+    reconnectAttempts++;
     setTimeout(connect, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 5000);
   };
 
   ws.onerror = () => ws.close();
