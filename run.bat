@@ -1,26 +1,37 @@
 @echo off
 cd /d "%~dp0"
 
-rem Force offline: all models are local after first-time setup; no network calls at runtime
+rem Force offline: all models are local; no network calls at runtime
 set HF_HUB_OFFLINE=1
 set TRANSFORMERS_OFFLINE=1
 
-rem ── Single-instance guard for the backend ────────────────────────────────────
-rem Try to connect to port 7549 (the lock port pulse.py holds).
-rem If it succeeds, the backend is already running — skip launching it.
-rem If it fails, launch the backend fresh.
+rem ── Step 1: Start backend only if not already running ────────────────────────
 powershell -NoProfile -Command ^
-  "$t = New-Object Net.Sockets.TcpClient; " ^
-  "try { $t.Connect('127.0.0.1', 7549); $t.Close(); exit 0 } catch { exit 1 }" ^
+  "$t=New-Object Net.Sockets.TcpClient;try{$t.Connect('127.0.0.1',7549);$t.Close();exit 0}catch{exit 1}" ^
   >nul 2>&1
+
 if %errorlevel% == 0 (
-    echo Pulse backend already running - skipping relaunch.
-) else (
-    echo Starting Pulse backend...
-    start "Pulse Core" /MIN venv\Scripts\python.exe pulse.py %*
+    echo [Pulse] Backend already running.
+    goto launch_ui
 )
 
-rem ── Always open / bring forward the UI ───────────────────────────────────────
-rem The UI auto-connects once the backend is ready, so it's safe to open it
-rem even if the backend is still booting. It will show "Starting up..." until connected.
+echo [Pulse] Starting backend...
+start "Pulse Core" /MIN venv\Scripts\python.exe pulse.py %*
+
+rem ── Step 2: Wait until WebSocket port 7550 is open (backend is ready) ────────
+echo [Pulse] Waiting for backend to be ready...
+:wait_loop
+    timeout /t 1 /nobreak >nul
+    powershell -NoProfile -Command ^
+      "$t=New-Object Net.Sockets.TcpClient;try{$t.Connect('127.0.0.1',7550);$t.Close();exit 0}catch{exit 1}" ^
+      >nul 2>&1
+    if %errorlevel% == 0 goto backend_ready
+goto wait_loop
+
+:backend_ready
+echo [Pulse] Backend ready.
+
+rem ── Step 3: Launch UI ─────────────────────────────────────────────────────────
+:launch_ui
+echo [Pulse] Launching UI...
 start "" ui\pulse-ui.exe
