@@ -6,6 +6,10 @@ v2 only labels windows that overlap actual speech, uses more voices/speeds,
 noise/gain augmentation, many more negatives, and validates on held-out voices.
 """
 import os
+import sys
+import types
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import numpy as np
 import scipy.signal
 import torch
@@ -22,6 +26,15 @@ from openwakeword.train import Model
 MODELS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'models'))
 CLIP_LEN = 48000  # 3.0s at 16k — must exceed 16 feature frames after the embedder's context window
 rng = np.random.default_rng(42)
+
+# The embedder produces FEWER frames than CLIP_LEN's nominal 3s would suggest (measured: 28,
+# not 37). place() below must never let a clip's END land past this — otherwise the labeling
+# functions either silently drop the example (the crash we chased earlier) or, worse, mislabel
+# whatever frames ARE available as "the word just ended" even when that's untrue for THIS clip
+# (this collapsed a trained model into firing 100% confidence on pure silence). Measuring it
+# directly here instead of hardcoding a number keeps this correct if the embedder ever changes.
+F = AudioFeatures(device='cpu', ncpu=4)
+FRAMES_PER_CLIP = F.embed_clips(np.zeros((1, CLIP_LEN), dtype=np.int16), batch_size=1)[0].shape[0]
 
 # WAKE_WORD is the phrase being trained. Internal class label always stays "pulse"
 # (wake_listener.py matches on that fixed name) — this only changes what audio is positive.
@@ -50,17 +63,22 @@ def augment(clip):
     return np.clip(out, -1, 1).astype(np.float32)
 
 def place(clip):
-    """Place clip at a random offset inside a CLIP_LEN buffer; return buffer + speech frame range."""
     buf = np.zeros(CLIP_LEN, dtype=np.float32)
     clip = clip[:CLIP_LEN]
-    off = rng.integers(0, CLIP_LEN - len(clip) + 1)
+    # OpenWakeWord's Google Speech Embedding model requires 76 melspec frames (760ms = 12160 samples)
+    # of audio context before emitting each 80ms feature frame.
+    RECEPTIVE_FIELD_SAMPLES = 12160
+    max_off = max(0, CLIP_LEN - len(clip))
+    off = rng.integers(0, max_off + 1)
     buf[off:off + len(clip)] = clip
-    # oww features: 1 frame per 1280 samples (80ms)
-    f_start, f_end = off // 1280, (off + len(clip)) // 1280
+    # f_end is the feature frame index corresponding to when the spoken word actually finishes
+    f_end = max(16, (off + len(clip) - RECEPTIVE_FIELD_SAMPLES) // 1280)
+    f_start = max(0, (off - RECEPTIVE_FIELD_SAMPLES) // 1280)
     return (buf * 32767).astype(np.int16), f_start, f_end
 
 def positive_windows(feats, f_start, f_end):
-    """Yield 16-frame windows whose END lands just after the speech ends (like streaming detection)."""
+    """Yield 16-frame windows whose END lands just after the speech ends (like streaming detection).
+    place() now guarantees f_end is always within feats.shape[0] — no clamping needed here."""
     X = []
     for end in range(max(f_end - 1, 16), min(f_end + 3, feats.shape[0]) + 1):
         w = feats[end - 16:end, :]
@@ -117,18 +135,39 @@ for _ in range(40):
     neg_raw.append(((rng.normal(0, lvl, CLIP_LEN) * 32767).clip(-32767, 32767).astype(np.int16), 0, 0))
 print(f"[{elapsed()}] Synthesis done — pos={len(pos_raw)} neg={len(neg_raw)}")
 
-print(f"[{elapsed()}] Extracting audio features (this can take 1-2 min)...")
-F = AudioFeatures(device='cpu', ncpu=4)
-pos_feats = F.embed_clips(np.array([b for b, _, _ in pos_raw]), batch_size=32)
-neg_feats = F.embed_clips(np.array([b for b, _, _ in neg_raw]), batch_size=32)
+print(f"[{elapsed()}] Extracting audio features ({len(pos_raw) + len(neg_raw)} clips)...")
+# F was already created near the top of the file (needed there for the FRAMES_PER_CLIP probe) — reused, not recreated.
+
+def embed_with_progress(label, raw_list, chunk=128):
+    # embed_clips() has no progress callback and this dataset can be 1000+ clips once
+    # real samples accumulate (40x augmentation each) — chunking it just for periodic
+    # prints keeps the UI updating instead of sitting frozen on one line for minutes.
+    bufs = np.array([b for b, _, _ in raw_list])
+    if len(bufs) == 0:
+        return []
+    out = []
+    for i in range(0, len(bufs), chunk):
+        out.extend(F.embed_clips(bufs[i:i + chunk], batch_size=32))
+        done = min(i + chunk, len(bufs))
+        print(f"  [{elapsed()}] {label}: {done}/{len(bufs)} clips")
+    return out
+
+pos_feats = embed_with_progress("positive features", pos_raw)
+neg_feats = embed_with_progress("negative features", neg_raw)
 
 X, Y = [], []
 for feats, (_, fs, fe) in zip(pos_feats, pos_raw):
     for w in positive_windows(feats, fs, fe):
         X.append(w); Y.append(1)
-    # silence regions of positive clips are negatives
+    # silence regions of positive clips are negatives. fs (frame-start) comes from the
+    # RAW buffer's random placement offset, not from the embedder's actual output frame
+    # count — for a short clip placed late in the 3s buffer, fs can exceed feats.shape[0],
+    # making this slice come back short of 16 rows and breaking np.array(X)'s uniform-shape
+    # assumption. positive_windows() above already guards this; this loop just hadn't.
     for i in range(0, max(fs - 16, 0), 4):
-        X.append(feats[i:i + 16, :]); Y.append(0)
+        w = feats[i:i + 16, :]
+        if w.shape[0] == 16:
+            X.append(w); Y.append(0)
 for feats in neg_feats:
     for w in all_windows(feats):
         X.append(w); Y.append(0)
@@ -141,7 +180,7 @@ print(f"windows: {len(X)} ({int(Y.sum())} positive)")
 n_pos = int(Y.sum())
 n_neg = len(Y) - n_pos
 pos_weight_val = n_neg / max(n_pos, 1)   # e.g. 8.0 if negatives outnumber positives 8:1
-print(f"Class balance: {n_pos} positive, {n_neg} negative  →  pos_weight={pos_weight_val:.2f}")
+print(f"Class balance: {n_pos} positive, {n_neg} negative  ->  pos_weight={pos_weight_val:.2f}")
 
 def run_training(lr=0.001, epochs=120):
     m = Model(n_classes=1, input_shape=(16, 96), model_type="dnn", layer_dim=128, n_blocks=1)
@@ -222,6 +261,13 @@ print(f"\nRESULT: {passes}/{total} passed ({pass_rate*100:.0f}%)")
 if pass_rate < 0.80:
     print("Pass rate below 80% — auto-retraining with lower learning rate...")
     model = run_training(lr=0.0003, epochs=200)
+    # `oww` (still open from validating the FIRST export above) holds pulse_v2.onnx.data
+    # memory-mapped — Windows refuses to let export_to_onnx overwrite it while that
+    # handle is alive, which crashed here with OSError: [Errno 22] Invalid argument.
+    # Release it before writing to the same path again.
+    del oww
+    import gc as _gc
+    _gc.collect()
     model.export_to_onnx(out, class_mapping="pulse")
     print(f"Re-exported {out}")
     # re-validate

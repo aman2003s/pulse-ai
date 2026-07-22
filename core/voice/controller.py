@@ -24,7 +24,7 @@ class VoiceController:
     def __init__(self, ws_server, planner_port=8081):
         self.tts = TTSService()
         self.capture = CapturePipeline()
-        self.stt = STTService("base.en")
+        self.stt = STTService()
         self.planner = PlannerClient(port=planner_port)
         self.executor = ToolExecutor()
         self.tasks = TaskManager()
@@ -44,7 +44,15 @@ class VoiceController:
         self.narrate = False  # A3: announce focused-window changes
         self.typing_echo = TypingEcho(self.tts)  # opt-in, off by default, skips password fields
         self.last_spoken = ""
-        
+
+        # Proactive screen-context cache: refreshed in the background on foreground-window
+        # change (see _screen_context_loop), not read live on every command. The read itself
+        # (a UIA tree walk) already runs in the background this way — instead of paying that
+        # cost synchronously after the user finishes speaking, it's usually already done by
+        # the time a command arrives, so context injection below becomes a cache read.
+        self._screen_cache = {}
+        self._screen_cache_lock = threading.Lock()
+
         # We need a reference to the running event loop for broadcasting
         self.loop = asyncio.get_event_loop()
         
@@ -248,8 +256,18 @@ class VoiceController:
         # whole point of a screen-aware assistant — "open my email folder" while the
         # Desktop is open on screen should be resolved from the VISIBLE items (the
         # 'emails' folder is right there), not a blind filesystem search.
+        #
+        # This used to call read_screen() live, right here, on every single command —
+        # a synchronous UIA tree walk paid AFTER the user finished speaking. _screen_
+        # context_loop now keeps this refreshed in the background on window-focus change,
+        # so by the time a command arrives it's normally already ready — this is a cache
+        # read, not a walk. Only the very first command of a session (cache still empty,
+        # background loop hasn't had a chance to run yet) falls back to a live read.
         try:
-            screen = registry.get_tool("read_screen").execute({})
+            with self._screen_cache_lock:
+                screen = dict(self._screen_cache)
+            if not screen:
+                screen = registry.get_tool("read_screen").execute({})
             if screen.get("success"):
                 items = screen.get("controls", [])[:20]
                 system_prompt += (
@@ -492,6 +510,11 @@ class VoiceController:
         with self.lock:
             if self.state != "idle":
                 return
+            # Claim "acting" synchronously, in the SAME lock as the idle check, not just
+            # inside the background thread — otherwise a wake-word trigger landing in the
+            # gap before the thread starts would see state still "idle" and start a second,
+            # overlapping session racing this one.
+            self.state = "acting"
         if word:
             import re as _re
             clean = _re.sub(r"[^a-z ]", "", word.strip().lower())[:20]
@@ -499,14 +522,110 @@ class VoiceController:
                 self.wake_word = clean
         self._safe_thread(self._train_wake_flow)
 
+    def _play_asset(self, name_or_path: str):
+        """Play a pre-baked static WAV — zero AI, zero lag. Accepts either a bare
+        filename under models/assets/ or a full path (e.g. from _word_prompt_asset)."""
+        import soundfile as sf
+        import sounddevice as sd
+        if os.path.isabs(name_or_path):
+            path = name_or_path
+        else:
+            root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+            path = os.path.join(root, 'models', 'assets', name_or_path)
+        data, fs = sf.read(path, dtype='float32')
+        sd.stop()
+        sd.play(data, fs)
+        sd.wait()
+
+    _WORD_PROMPT_TEXT = {
+        "say": lambda w: f"Say {w} now.",
+        "again": lambda w: f"Again, say {w}.",
+        "trained": lambda w: f"Training complete. {w} is now your trained wake word.",
+    }
+
+    def _word_prompt_asset(self, kind: str) -> str:
+        """kind: 'say', 'again', or 'trained'. The default wake word 'pulse' already has a
+        pre-baked prompt_{kind}.wav (zero AI). If the user changed the wake word to something
+        else, Kokoro is called exactly ONCE per word to synthesize and cache a new asset —
+        every training round and every future retrain after that reuses the cached file, so
+        Kokoro never runs again for that word."""
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        assets_dir = os.path.join(root, 'models', 'assets')
+        word = self.wake_word
+        if word == "pulse":
+            return os.path.join(assets_dir, f"prompt_{kind}.wav")
+        safe = "".join(c for c in word if c.isalnum()) or "word"
+        cached = os.path.join(assets_dir, f"prompt_{kind}_{safe}.wav")
+        if not os.path.exists(cached):
+            import numpy as np
+            import scipy.signal
+            import scipy.io.wavfile as wf
+            text = self._WORD_PROMPT_TEXT[kind](word)
+            chunks = [audio for _, _, audio in self.tts.pipeline(text, voice=self.tts.voice, speed=1.0)]
+            audio_24k = np.concatenate(chunks).astype(np.float32)
+            audio_16k = scipy.signal.resample_poly(audio_24k, up=2, down=3).astype(np.float32)
+            pcm = (np.clip(audio_16k, -1, 1) * 32767).astype(np.int16)
+            wf.write(cached, 16000, pcm)
+        return cached
+
+    def _calibrate_ambient(self) -> float:
+        import numpy as np
+        import sounddevice as sd
+        buf = sd.rec(int(16000 * 1.0), samplerate=16000, channels=1, dtype='int16')
+        sd.wait()
+        ambient = float(np.sqrt(np.mean(buf.flatten().astype(np.float64) ** 2)))
+        return max(ambient * 4.0, 80)
+
+    def _record_until_silence_lite(self, threshold: float):
+        """VAD-lite (32ms RMS chunks, no Silero) — fast enough to feel instant.
+        Returns None if no speech was detected at all (caller retries)."""
+        import numpy as np
+        import sounddevice as sd
+        SR, CHUNK = 16000, 512
+        chunks, has_spoken, silent_since, started = [], False, None, time.time()
+        with sd.InputStream(samplerate=SR, channels=1, dtype='int16', blocksize=CHUNK) as stream:
+            while True:
+                chunk, _ = stream.read(CHUNK)
+                flat = chunk.flatten()
+                chunks.append(flat)
+                energy = float(np.sqrt(np.mean(flat.astype(np.float64) ** 2)))
+                if energy >= threshold:
+                    has_spoken = True
+                    silent_since = None
+                elif has_spoken:
+                    if silent_since is None:
+                        silent_since = time.time()
+                    elif (time.time() - silent_since) * 1000 >= 600:
+                        break
+                if time.time() - started >= 2.5:
+                    break
+        if not has_spoken:
+            return None
+        return np.concatenate(chunks)
+
     def _train_wake_flow(self):
         import glob, subprocess, sys, gc
-        import sounddevice as sd
         import scipy.io.wavfile as wavf
         word = self.wake_word
         root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
         outdir = os.path.join(root, 'models', 'user_samples')
         os.makedirs(outdir, exist_ok=True)
+
+        # Instant UI feedback the moment the button is clicked — before any audio work.
+        self.broadcast_state("acting")
+        asyncio.run_coroutine_threadsafe(
+            self.ws_server.broadcast({"v": 1, "type": "training_progress",
+                                      "status": "started", "text": "Preparing microphone…"}),
+            self.loop
+        )
+
+        # WakeListener keeps its own live mic InputStream running in the background at all
+        # times. Recording samples below opens ANOTHER InputStream on the same device while
+        # that one is still active — two concurrent PortAudio streams on the same device can
+        # hang or crash the whole process on Windows (this is what forced a run.bat restart).
+        # Stop it now, before any recording, and guarantee it comes back in `finally` below.
+        self.listener.stop()
+
         # Only wipe samples when the wake word itself changed (old-word audio would poison
         # training). Otherwise ACCUMULATE — each retrain adds 5 more real samples on top of
         # prior ones instead of discarding them, capped so training time stays bounded.
@@ -517,24 +636,65 @@ class VoiceController:
                 os.remove(f)
         MAX_SAMPLES = 25
         existing = len(glob.glob(os.path.join(outdir, '*.wav')))
-        self.broadcast_state("speaking")
-        verb = "Let's add more training samples for your wake word" if existing else "Let's set your wake word"
-        self.tts.speak(f"{verb}. I'll ask you to say {word} five times.")
-        for i in range(5):
-            self.tts.speak(f"Say {word} after the beep. {i + 1} of 5.")
-            self.capture.play_earcon()
-            audio = sd.rec(int(2.0 * 16000), samplerate=16000, channels=1, dtype='int16')
-            sd.wait()
-            idx = ((existing + i) % MAX_SAMPLES) + 1  # cycles out the oldest once at the cap
-            wavf.write(os.path.join(outdir, f'sample_{idx}.wav'), 16000, audio.flatten())
+
+        threshold = self._calibrate_ambient()
+
+        say_asset = self._word_prompt_asset("say")      # Kokoro only runs here, once, if word != "pulse"
+        again_asset = self._word_prompt_asset("again")  # cached to disk — every future call is pre-baked
+
+        NUM_SAMPLES, MAX_RETRIES = 5, 3
+        collected = 0
+        while collected < NUM_SAMPLES:
+            asyncio.run_coroutine_threadsafe(
+                self.ws_server.broadcast({"v": 1, "type": "training_progress",
+                                          "status": "running",
+                                          "text": f"Sample {collected + 1} of {NUM_SAMPLES}…"}),
+                self.loop
+            )
+            attempt, saved = 0, False
+            while attempt < MAX_RETRIES and not saved:
+                self._play_asset(say_asset if attempt == 0 else again_asset)
+                # beep_start.wav is a full 180ms tone — audible where the tiny wake-ack
+                # earcon (two 80ms beeps) was reported too quiet to notice.
+                self._play_asset("beep_start.wav")
+                audio = self._record_until_silence_lite(threshold)
+                # _record_until_silence_lite already confirms a chunk cleared the energy
+                # threshold before returning non-None — re-checking RMS over the WHOLE clip
+                # here (including leading/trailing silence padding) dilutes the average and
+                # was rejecting genuine speech, forcing 10+ retries for 5 samples.
+                if audio is None:
+                    attempt += 1
+                    self._play_asset("beep_bad.wav")
+                    continue
+                idx = ((existing + collected) % MAX_SAMPLES) + 1  # cycles out the oldest once at the cap
+                wavf.write(os.path.join(outdir, f'sample_{idx}.wav'), 16000, audio)
+                self._play_asset("beep_ok.wav")
+                saved = True
+            if not saved:
+                # Never hang on a bad mic/silence — skip and keep going with what we have.
+                asyncio.run_coroutine_threadsafe(
+                    self.ws_server.broadcast({"v": 1, "type": "training_progress",
+                                              "status": "running",
+                                              "text": f"Sample {collected + 1} skipped — too quiet"}),
+                    self.loop
+                )
+            collected += 1
+
         with open(marker, 'w', encoding='utf-8') as f:
             f.write(word)
-        self.tts.speak("Thank you. Training now. This takes about ten minutes. I'll tell you when it's done. You can keep using Pulse meanwhile.")
-        self.broadcast_state("idle")
-        # broadcast a special training state so the UI can show a progress indicator
+        # NOT prompt_done.wav — that asset says "Training complete", which is false here:
+        # the 5 samples are collected but the ~10 min model training below hasn't run yet.
+        self._play_asset("ack.wav")
+        # Deliberately staying "acting" (not idle) through the whole training subprocess —
+        # this blocks wake-word triggers and typed commands for the duration instead of
+        # letting them run concurrently. Training is CPU-heavy (feature extraction + 120+
+        # training epochs) and competing with LLM planning/TTS for the same CPU, or a
+        # wake-word trigger starting a session mid-training, was unnecessary risk for a
+        # feature that only needs to run occasionally. Simpler and more reliable to just
+        # make training block until it's done.
         asyncio.run_coroutine_threadsafe(
             self.ws_server.broadcast({"v": 1, "type": "training_progress",
-                                      "status": "started", "text": "Training started…"}),
+                                      "status": "running", "text": "Samples collected. Training model…"}),
             self.loop
         )
 
@@ -542,7 +702,7 @@ class VoiceController:
             p = os.path.join(root, 'models', f)
             if os.path.exists(p):
                 os.remove(p)
-        env = dict(os.environ, PYTHONUTF8='1', PULSE_WAKE_WORD=word)
+        env = dict(os.environ, PYTHONUTF8='1', PYTHONUNBUFFERED='1', PULSE_WAKE_WORD=word)
         proc = subprocess.Popen(
             [sys.executable, os.path.join(root, 'scripts', 'train_pulse_v2.py')],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -561,52 +721,101 @@ class VoiceController:
                                           "status": "running", "text": line}),
                 self.loop
             )
-        proc.wait()
+        exit_code = proc.wait()
         full_output = "\n".join(stdout_lines)
-        if 'Exported' not in full_output and 'exported' not in full_output:
-            print("Wake training failed output:", full_output[-500:])
-            asyncio.run_coroutine_threadsafe(
-                self.ws_server.broadcast({"v": 1, "type": "training_progress",
-                                          "status": "failed", "text": "Training failed — model unchanged"}),
-                self.loop
-            )
+        # BUG FIXED: this used to check ONLY whether "Exported" appeared anywhere in the
+        # output — but the auto-retrain path (pass_rate < 80%) prints "Exported" for the
+        # FIRST attempt, then may crash partway through re-exporting the SECOND, improved
+        # attempt. That crash left the original, worse model's "Exported" text still in
+        # full_output, so this would have reported success and swapped in a model that
+        # actually scored 0% on its own validation. The exit code is the authoritative
+        # signal — a Python traceback always exits non-zero, a real completion is 0.
+        training_ok = exit_code == 0 and ('Exported' in full_output or 'exported' in full_output)
+
         try:
-            self.listener.stop()
-            self.listener.owwModel = None
-            gc.collect()
-            time.sleep(1)
-            import onnx, shutil
-            mdl = os.path.join(root, 'models')
-            m = onnx.load(os.path.join(mdl, 'pulse_v2.onnx'), load_external_data=False)
-            for t in m.graph.initializer:
-                for e in t.external_data:
-                    if e.key == 'location' and 'pulse_v2' in e.value:
-                        e.value = 'pulse.onnx.data'
-            os.remove(os.path.join(mdl, 'pulse.onnx'))
-            os.remove(os.path.join(mdl, 'pulse.onnx.data'))
-            onnx.save(m, os.path.join(mdl, 'pulse.onnx'))
-            shutil.move(os.path.join(mdl, 'pulse_v2.onnx.data'), os.path.join(mdl, 'pulse.onnx.data'))
-            os.remove(os.path.join(mdl, 'pulse_v2.onnx'))
-            self.listener.start()
-            with get_db() as conn:
-                conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('wake_word', ?)", (word,))
-            self.broadcast_state("speaking")
-            self.tts.speak(f"Done. {word} is now your trained wake word.")
-            asyncio.run_coroutine_threadsafe(
-                self.ws_server.broadcast({"v": 1, "type": "training_progress",
-                                          "status": "done", "text": f"✓ Wake word trained: {word}"}),
-                self.loop
-            )
+            if not training_ok:
+                # BUG FIXED: this used to fall through into the swap block below
+                # regardless, which tried onnx.load() on a pulse_v2.onnx that was never
+                # written (training never got that far), hit FileNotFoundError, and then
+                # told the user "Restart to activate new model" — a misleading message
+                # implying a fix exists when there's nothing to activate at all.
+                print("Wake training failed output:", full_output[-500:])
+                self._play_asset("beep_bad.wav")
+                asyncio.run_coroutine_threadsafe(
+                    self.ws_server.broadcast({"v": 1, "type": "training_progress",
+                                              "status": "failed", "text": "Training failed — model unchanged"}),
+                    self.loop
+                )
+            else:
+                self.listener.owwModel = None
+                gc.collect()
+                time.sleep(1)
+                import onnx, shutil
+                mdl = os.path.join(root, 'models')
+                m = onnx.load(os.path.join(mdl, 'pulse_v2.onnx'), load_external_data=False)
+                for t in m.graph.initializer:
+                    for e in t.external_data:
+                        if e.key == 'location' and 'pulse_v2' in e.value:
+                            e.value = 'pulse.onnx.data'
+                os.remove(os.path.join(mdl, 'pulse.onnx'))
+                os.remove(os.path.join(mdl, 'pulse.onnx.data'))
+                onnx.save(m, os.path.join(mdl, 'pulse.onnx'))
+                shutil.move(os.path.join(mdl, 'pulse_v2.onnx.data'), os.path.join(mdl, 'pulse.onnx.data'))
+                os.remove(os.path.join(mdl, 'pulse_v2.onnx'))
+                with get_db() as conn:
+                    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('wake_word', ?)", (word,))
+                # Real completion — properly announce it (pre-baked for "pulse", cached
+                # per-word Kokoro synthesis otherwise), not just a beep.
+                self._play_asset(self._word_prompt_asset("trained"))
+                asyncio.run_coroutine_threadsafe(
+                    self.ws_server.broadcast({"v": 1, "type": "training_progress",
+                                              "status": "done", "text": f"✓ Wake word trained: {word}"}),
+                    self.loop
+                )
         except Exception as e:
+            # Only reachable now for a genuine swap-step failure on a model that DID
+            # export successfully (e.g. a corrupt/partial onnx write) — "restart to
+            # activate" is an accurate message in this case, unlike before.
             print("Wake model swap failed:", e)
-            self.broadcast_state("speaking")
-            self.tts.speak("I trained the model but couldn't activate it live. It will be active after the next restart.")
+            self._play_asset("beep_bad.wav")
             asyncio.run_coroutine_threadsafe(
                 self.ws_server.broadcast({"v": 1, "type": "training_progress",
                                           "status": "done", "text": "Restart to activate new model"}),
                 self.loop
             )
+        finally:
+            # ALWAYS resume wake detection, whether training succeeded, failed, or the
+            # swap itself threw — otherwise wake-word listening stays silently off.
+            self.listener.start()
         self.broadcast_state("idle")
+
+    def _refresh_screen_cache(self):
+        """Runs the actual UIA walk (the expensive part) off the polling loop's own
+        thread, so a slow window never delays the next foreground-change check."""
+        try:
+            screen = registry.get_tool("read_screen").execute({})
+            if screen.get("success"):
+                with self._screen_cache_lock:
+                    self._screen_cache = screen
+        except Exception:
+            pass
+
+    def _screen_context_loop(self):
+        """Polls the foreground window (a near-free Win32 call, not a UIA walk) and only
+        re-reads the screen when it actually changes — so by the time a command arrives,
+        context is normally already cached instead of being read synchronously after the
+        fact. Same shape as _narration_loop's polling, just unconditional and UIA-backed."""
+        import win32gui
+        last_hwnd = None
+        while True:
+            time.sleep(0.5)
+            try:
+                hwnd = win32gui.GetForegroundWindow()
+            except Exception:
+                continue
+            if hwnd and hwnd != last_hwnd:
+                last_hwnd = hwnd
+                threading.Thread(target=self._refresh_screen_cache, daemon=True).start()
 
     def _narration_loop(self):
         import win32gui
@@ -745,6 +954,7 @@ class VoiceController:
         except Exception as e:
             print(f"Typing echo hook unavailable (may need admin rights): {e}")
         threading.Thread(target=self._narration_loop, daemon=True).start()
+        threading.Thread(target=self._screen_context_loop, daemon=True).start()
         threading.Thread(target=self.run_onboarding, daemon=True).start()
         print("Voice controller started. Say 'pulse' to trigger.")
 
