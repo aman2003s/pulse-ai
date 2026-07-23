@@ -74,14 +74,21 @@ save_pcm("beep_bad.wav", np.concatenate([
     fade(sine(440, 0.15)),
 ]))
 
-# Live-app wake acknowledgement — the one sound users hear on every single wake,
-# so it needs to actually be heard. The old version (two identical 80ms beeps at
-# amplitude 0.6) was reported too quiet to notice. This is a louder ascending
-# two-note chime (like Google/Alexa's "I heard you" tone — a rising interval reads
-# as confirmation) at near-max amplitude, still short enough to feel instant.
+def chime_note(freq, duration_s, attack_ms=12, amplitude=0.5):
+    t = np.linspace(0, duration_s, int(SR * duration_s), endpoint=False)
+    # Warm bell sound: Fundamental + soft 2nd & 3rd harmonic
+    signal = np.sin(2 * np.pi * freq * t) + 0.25 * np.sin(2 * np.pi * (freq * 2) * t) + 0.1 * np.sin(2 * np.pi * (freq * 3) * t)
+    # Exponential bell decay envelope
+    env = np.exp(-t * 9.0)
+    n_att = int(SR * attack_ms / 1000)
+    env[:n_att] *= np.linspace(0, 1, n_att)
+    return (signal * env * amplitude).astype(np.float32)
+
+# Sweet, modern two-tone assistant wake chime (C5 -> G5, 523Hz -> 784Hz) with warm bell harmonics
 save_pcm("ack.wav", np.concatenate([
-    fade(sine(784,  0.13, amplitude=0.9)), gap(0.02),
-    fade(sine(1047, 0.16, amplitude=0.9)),
+    chime_note(523.25, 0.13, amplitude=0.55),
+    gap(0.015),
+    chime_note(783.99, 0.18, amplitude=0.50),
 ]))
 
 

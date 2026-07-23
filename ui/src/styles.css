@@ -35,75 +35,69 @@ body {
 #pill.faded { opacity: 0.35; }
 #pill:hover { opacity: 1; }
 
-/* ---- state glow: the pill's own border carries the same color as the orb ----
-   Same signal, twice as visible — useful across the whole width of the pill,
-   not just a 22px dot, and readable out of the corner of your eye. Colors and
-   which states pulse vs. hold static match the orb rules below exactly. */
+/* ---- state glow: synchronized with orb animation, contained within padding margin ---- */
 #pill.idle {
   border-color: rgba(107, 114, 128, 0.4);
-  box-shadow: 0 0 10px rgba(107, 114, 128, 0.18);
+  box-shadow: 0 0 6px rgba(107, 114, 128, 0.18);
 }
 #pill.listening {
   border-color: rgba(56, 189, 248, 0.85);
-  box-shadow: 0 0 18px rgba(56, 189, 248, 0.45);
+  box-shadow: 0 0 8px rgba(56, 189, 248, 0.4);
   animation: pill-glow-listening 1.2s ease-in-out infinite;
 }
 #pill.thinking {
   border-color: rgba(167, 139, 250, 0.85);
-  box-shadow: 0 0 18px rgba(167, 139, 250, 0.45);
+  box-shadow: 0 0 8px rgba(167, 139, 250, 0.4);
   animation: pill-glow-thinking 0.7s ease-in-out infinite;
 }
 #pill.acting {
   border-color: rgba(251, 191, 36, 0.8);
-  box-shadow: 0 0 16px rgba(251, 191, 36, 0.4);
+  box-shadow: 0 0 8px rgba(251, 191, 36, 0.4);
 }
 #pill.speaking {
   border-color: rgba(52, 211, 153, 0.85);
-  box-shadow: 0 0 18px rgba(52, 211, 153, 0.45);
+  box-shadow: 0 0 8px rgba(52, 211, 153, 0.4);
   animation: pill-glow-speaking 1s ease-in-out infinite;
 }
 #pill.disconnected {
   border-color: rgba(239, 68, 68, 0.7);
-  box-shadow: 0 0 14px rgba(239, 68, 68, 0.35);
-}
-@keyframes pill-glow-listening {
-  0%, 100% { border-color: rgba(56, 189, 248, 0.5);  box-shadow: 0 0 8px rgba(56, 189, 248, 0.25); }
-  50%       { border-color: rgba(56, 189, 248, 1);    box-shadow: 0 0 22px rgba(56, 189, 248, 0.6); }
-}
-@keyframes pill-glow-thinking {
-  0%, 100% { border-color: rgba(167, 139, 250, 0.5); box-shadow: 0 0 8px rgba(167, 139, 250, 0.25); }
-  50%       { border-color: rgba(167, 139, 250, 1);   box-shadow: 0 0 22px rgba(167, 139, 250, 0.6); }
-}
-@keyframes pill-glow-speaking {
-  0%, 100% { border-color: rgba(52, 211, 153, 0.5);  box-shadow: 0 0 8px rgba(52, 211, 153, 0.25); }
-  50%       { border-color: rgba(52, 211, 153, 1);    box-shadow: 0 0 22px rgba(52, 211, 153, 0.6); }
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.35);
 }
 
-/* ---- wake-word training cue: glowing border on the existing pill ----
-   No new elements, no layout change — just the pill's own border pulsing
-   for as long as training is running, so it's impossible to miss. Declared
-   AFTER the state-glow rules above so it wins (equal specificity, source
-   order) over "acting" while both classes are present during training. */
+@keyframes pill-glow-listening {
+  0%, 100% { border-color: rgba(56, 189, 248, 0.4);  box-shadow: 0 0 4px rgba(56, 189, 248, 0.2); }
+  50%       { border-color: rgba(56, 189, 248, 0.95); box-shadow: 0 0 10px rgba(56, 189, 248, 0.5); }
+}
+@keyframes pill-glow-thinking {
+  0%, 100% { border-color: rgba(167, 139, 250, 0.4); box-shadow: 0 0 4px rgba(167, 139, 250, 0.2); }
+  50%       { border-color: rgba(167, 139, 250, 0.95); box-shadow: 0 0 10px rgba(167, 139, 250, 0.5); }
+}
+@keyframes pill-glow-speaking {
+  0%, 100% { border-color: rgba(52, 211, 153, 0.4);  box-shadow: 0 0 4px rgba(52, 211, 153, 0.2); }
+  50%       { border-color: rgba(52, 211, 153, 0.95); box-shadow: 0 0 10px rgba(52, 211, 153, 0.5); }
+}
+
+/* ---- wake-word training cue ---- */
 #pill.training {
   border-color: rgba(167, 139, 250, 0.9);
-  box-shadow: 0 0 16px rgba(167, 139, 250, 0.55);
+  box-shadow: 0 0 8px rgba(167, 139, 250, 0.5);
   animation: pill-train-glow 1.6s ease-in-out infinite;
 }
 #pill.training-done {
   border-color: rgba(52, 211, 153, 0.9);
-  box-shadow: 0 0 16px rgba(52, 211, 153, 0.55);
+  box-shadow: 0 0 8px rgba(52, 211, 153, 0.5);
   animation: none;
   transition: border-color 0.4s ease, box-shadow 0.4s ease;
 }
 #pill.training-failed {
   border-color: rgba(239, 68, 68, 0.9);
-  box-shadow: 0 0 16px rgba(239, 68, 68, 0.55);
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.5);
   animation: none;
   transition: border-color 0.4s ease, box-shadow 0.4s ease;
 }
 @keyframes pill-train-glow {
-  0%, 100% { border-color: rgba(167, 139, 250, 0.5); box-shadow: 0 0 8px rgba(167, 139, 250, 0.3); }
-  50%       { border-color: rgba(167, 139, 250, 1);   box-shadow: 0 0 20px rgba(167, 139, 250, 0.7); }
+  0%, 100% { border-color: rgba(167, 139, 250, 0.4); box-shadow: 0 0 4px rgba(167, 139, 250, 0.25); }
+  50%       { border-color: rgba(167, 139, 250, 1);   box-shadow: 0 0 10px rgba(167, 139, 250, 0.6); }
 }
 @media (prefers-reduced-motion: reduce) {
   #pill.listening, #pill.thinking, #pill.speaking, #pill.training { animation: none; }
@@ -121,18 +115,26 @@ body {
   padding: 0;
   cursor: pointer;
 }
-#orb:hover { transform: scale(1.2); box-shadow: 0 0 10px rgba(255, 255, 255, 0.4); }
+#orb:hover { transform: scale(1.2); box-shadow: 0 0 8px rgba(255, 255, 255, 0.4); }
 #orb:focus-visible { outline: 2px solid #38bdf8; outline-offset: 2px; }
 .idle      #orb { background: #6b7280; }
-.listening #orb { background: #38bdf8; animation: breathe 1.2s ease-in-out infinite; box-shadow: 0 0 14px #38bdf8; }
-.thinking  #orb { background: #a78bfa; animation: breathe 0.7s ease-in-out infinite; box-shadow: 0 0 14px #a78bfa; }
-.acting    #orb { background: #fbbf24; box-shadow: 0 0 14px #fbbf24; }
-.speaking  #orb { background: #34d399; animation: breathe 1s ease-in-out infinite; box-shadow: 0 0 14px #34d399; }
+.listening #orb { background: #38bdf8; animation: breathe-listening 1.2s ease-in-out infinite; box-shadow: 0 0 8px #38bdf8; }
+.thinking  #orb { background: #a78bfa; animation: breathe-thinking 0.7s ease-in-out infinite; box-shadow: 0 0 8px #a78bfa; }
+.acting    #orb { background: #fbbf24; box-shadow: 0 0 8px #fbbf24; }
+.speaking  #orb { background: #34d399; animation: breathe-speaking 1.0s ease-in-out infinite; box-shadow: 0 0 8px #34d399; }
 .disconnected #orb { background: #ef4444; }
 
-@keyframes breathe {
-  0%, 100% { transform: scale(1); }
-  50% { transform: scale(1.25); }
+@keyframes breathe-listening {
+  0%, 100% { transform: scale(1); opacity: 0.85; }
+  50%       { transform: scale(1.22); opacity: 1; }
+}
+@keyframes breathe-thinking {
+  0%, 100% { transform: scale(1); opacity: 0.85; }
+  50%       { transform: scale(1.22); opacity: 1; }
+}
+@keyframes breathe-speaking {
+  0%, 100% { transform: scale(1); opacity: 0.85; }
+  50%       { transform: scale(1.22); opacity: 1; }
 }
 @media (prefers-reduced-motion: reduce) {
   #orb { animation: none !important; }
@@ -203,13 +205,59 @@ body {
 #a11y-row {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   cursor: pointer;
   padding: 3px 8px;
-  border-radius: 8px;
+  border-radius: 12px;
   background: rgba(255, 255, 255, 0.06);
+  transition: background 0.2s ease;
 }
-#a11y-row input { width: 15px; height: 15px; }
+#a11y-row:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* ---- sleek toggle switch button ---- */
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 30px;
+  height: 17px;
+  flex: none;
+}
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.toggle-slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background-color: rgba(255, 255, 255, 0.16);
+  transition: background-color 0.25s ease, box-shadow 0.25s ease;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+.toggle-slider:before {
+  position: absolute;
+  content: "";
+  height: 11px;
+  width: 11px;
+  left: 2px;
+  bottom: 2px;
+  background-color: #fff;
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  border-radius: 50%;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+.toggle-switch input:checked + .toggle-slider {
+  background-color: #38bdf8;
+  border-color: rgba(56, 189, 248, 0.8);
+  box-shadow: 0 0 6px rgba(56, 189, 248, 0.4);
+}
+.toggle-switch input:checked + .toggle-slider:before {
+  transform: translateX(13px);
+}
 
 #quick-row select {
   background: rgba(18, 18, 28, 0.85);
@@ -221,8 +269,7 @@ body {
   max-width: 150px;
 }
 
-/* ---- settings menu: floating popup anchored to the pill, never shifts layout ---- */
-#settings-menu[hidden] { display: none; }
+/* ---- settings menu: zero-flicker floating popup ---- */
 #settings-menu {
   position: absolute;
   bottom: calc(100% + 8px);
@@ -234,13 +281,25 @@ body {
   gap: 10px;
   padding: 12px 14px;
   border-radius: 14px;
-  background: rgba(24, 24, 34, 0.92);
+  background: rgba(24, 24, 34, 0.95);
   backdrop-filter: blur(18px);
   border: 1px solid rgba(255, 255, 255, 0.14);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
   font-size: 12px;
   color: rgba(255, 255, 255, 0.85);
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  pointer-events: auto;
 }
+#settings-menu[hidden] {
+  display: flex !important;
+  opacity: 0;
+  transform: translateY(6px);
+  pointer-events: none;
+  visibility: hidden;
+}
+
 .s-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 #settings-menu select, #settings-menu input[type="text"] {
   background: rgba(255, 255, 255, 0.08);
@@ -285,4 +344,3 @@ body {
   #status-line { color: #fff; }
   #detail-line { color: #ddd; }
 }
-

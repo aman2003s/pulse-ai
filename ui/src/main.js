@@ -32,6 +32,7 @@ function setState(state) {
   // Only swap the state class — a plain `className =` overwrite would also wipe
   // the "training" glow class applied independently during wake-word training.
   pill.classList.remove(...STATE_CLASSES);
+  void pill.offsetWidth; // force reflow so #orb and #pill animation clocks reset in lockstep
   pill.classList.add(state);
   statusLine.textContent = STATE_LABELS[state] || state;
   clearTimeout(fadeTimer);
