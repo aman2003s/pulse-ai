@@ -16,6 +16,7 @@
       <div id="status-line" aria-live="polite">Connecting to Pulse…</div>
       <div id="detail-line" aria-live="polite"></div>
     </div>
+    <button id="expand-btn" aria-label="Toggle controls panel" aria-expanded="true" title="Expand / collapse controls">▾</button>
     <button id="settings-btn" aria-label="Settings" aria-haspopup="true" aria-expanded="false" title="Settings">⚙</button>
     <button id="close-btn" aria-label="Close Pulse window" title="Close">✕</button>
 
@@ -29,25 +30,27 @@
     </div>
   </div>
 
-  <div id="input-row">
-    <input id="text-input" type="text" placeholder="Type a command… (Esc cancels)"
-           aria-label="Type a command to Pulse" autocomplete="off" />
-  </div>
+  <div id="controls-panel">
+    <div id="input-row">
+      <input id="text-input" type="text" placeholder="Type a command… (Esc cancels)"
+             aria-label="Type a command to Pulse" autocomplete="off" />
+    </div>
 
-  <div id="quick-row">
-    <label id="a11y-row" title="Guided feedback, window narration, and typing echo — all in one switch">
-      <span class="toggle-switch">
-        <input type="checkbox" id="a11y-chk" aria-label="Superhero Mode: guided feedback, narration, and typing echo" />
-        <span class="toggle-slider"></span>
-      </span>
-      Superhero Mode
-    </label>
-    <select id="mode-select" aria-label="Feedback mode">
-      <option>Minimal</option>
-      <option selected>Standard</option>
-      <option>Guided</option>
-    </select>
-    <select id="mic-select" aria-label="Microphone"><option value="">Default mic</option></select>
+    <div id="quick-row">
+      <label id="a11y-row" title="Guided feedback, window narration, and typing echo — all in one switch">
+        <span class="toggle-switch">
+          <input type="checkbox" id="a11y-chk" aria-label="Superhero Mode: guided feedback, narration, and typing echo" />
+          <span class="toggle-slider"></span>
+        </span>
+        Superhero Mode
+      </label>
+      <select id="mode-select" aria-label="Feedback mode">
+        <option>Minimal</option>
+        <option selected>Standard</option>
+        <option>Guided</option>
+      </select>
+      <select id="mic-select" aria-label="Microphone"><option value="">Default mic</option></select>
+    </div>
   </div>
 
   <div id="toast" role="alert" hidden></div>

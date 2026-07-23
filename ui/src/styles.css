@@ -157,18 +157,45 @@ body {
   text-overflow: ellipsis;
 }
 
-#settings-btn, #close-btn {
+#expand-btn, #settings-btn, #close-btn {
   flex: none;
   background: none;
   border: none;
   color: rgba(255, 255, 255, 0.5);
   font-size: 16px;
   cursor: pointer;
+  transition: color 0.2s ease, transform 0.25s ease;
 }
-#settings-btn:hover, #settings-btn:focus,
+#expand-btn {
+  font-size: 15px;
+  padding: 0 2px;
+}
+#expand-btn.collapsed {
+  transform: rotate(-90deg);
+}
+#expand-btn:hover, #settings-btn:hover, #settings-btn:focus,
 #close-btn:hover, #close-btn:focus { color: #fff; }
 #close-btn { font-size: 14px; }
 #close-btn:hover { color: #f87171; }
+
+/* ---- collapsible controls panel ---- */
+#controls-panel {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  max-height: 180px;
+  opacity: 1;
+  overflow: hidden;
+  transition: max-height 0.25s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.2s ease;
+  pointer-events: auto;
+}
+#controls-panel.collapsed {
+  max-height: 0 !important;
+  opacity: 0;
+  pointer-events: none;
+}
 
 /* ---- input row ---- */
 #input-row {

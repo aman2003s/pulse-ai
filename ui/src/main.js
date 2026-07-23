@@ -193,6 +193,29 @@ document.addEventListener("click", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !settingsMenu.hidden) closeSettingsMenu();
 });
+const expandBtn = document.getElementById("expand-btn");
+const controlsPanel = document.getElementById("controls-panel");
+
+expandBtn.addEventListener("click", async () => {
+  const isCollapsed = controlsPanel.classList.contains("collapsed");
+  if (isCollapsed) {
+    // Expanding: Resize window first to allocate height, then reveal panel — zero flicker
+    await syncWindowHeight(settingsMenu.hidden ? false : true, false);
+    controlsPanel.classList.remove("collapsed");
+    expandBtn.classList.remove("collapsed");
+    expandBtn.setAttribute("aria-expanded", "true");
+    await syncWindowHeight();
+  } else {
+    // Collapsing: Animate panel close first, then sync window height smoothly
+    controlsPanel.classList.add("collapsed");
+    expandBtn.classList.add("collapsed");
+    expandBtn.setAttribute("aria-expanded", "false");
+    setTimeout(() => {
+      syncWindowHeight();
+    }, 260);
+  }
+});
+
 modeSelect.addEventListener("change", () => {
   send({ type: "set_config", key: "feedback_mode", value: modeSelect.value });
 });
@@ -208,11 +231,7 @@ document.getElementById("mic-select").addEventListener("change", (e) => {
   if (e.target.value !== "") send({ type: "set_config", key: "mic_device", value: e.target.value });
 });
 
-// Measure the settings popup's natural height ONCE, synchronously, before first
-// paint (toggling `hidden` on and back off within a single script tick never
-// paints the in-between frame). This means opening it can resize the window to
-// fit BEFORE the popup is revealed, instead of "show, measure, then resize" —
-// which is what caused the visible clip-then-snap flicker.
+// Measure the settings popup's natural height ONCE, synchronously, before first paint
 let settingsMenuHeight = 0;
 (function measureSettingsMenu() {
   settingsMenu.hidden = false;
@@ -221,24 +240,19 @@ let settingsMenuHeight = 0;
 })();
 
 // --- size the OS window to exactly the rendered content, then bottom-center it ---
-// The window background is transparent, but the OS window rectangle isn't — any
-// area taller than what's actually drawn is invisible AND still eats clicks meant
-// for whatever's behind it. So height is never hand-picked: it's measured from the
-// real DOM every time visible content changes.
-async function syncWindowHeight(menuOpen) {
+async function syncWindowHeight(menuOpen, forceCollapsed) {
   try {
     const t = window.__TAURI__;
     if (!t || !t.window) return;
     const win = t.window.getCurrentWindow();
 
-    const rows = [pill, document.getElementById("input-row"), document.getElementById("quick-row")];
-    const rects = rows.map((el) => el.getBoundingClientRect());
+    const isCollapsed = forceCollapsed !== undefined ? forceCollapsed : controlsPanel.classList.contains("collapsed");
+    const visibleRows = isCollapsed ? [pill] : [pill, controlsPanel];
+    const rects = visibleRows.map((el) => el.getBoundingClientRect());
     let top = Math.min(...rects.map((r) => r.top));
     const bottom = Math.max(...rects.map((r) => r.bottom));
     if (menuOpen) top -= settingsMenuHeight + 8; // popup height + its own gap above the pill
     const pad = parseFloat(getComputedStyle(document.body).paddingTop) || 0;
-    // Small cushion: without it, the top pixel or two of the pill was getting clipped —
-    // rounding differences between our measurement and WebView2's actual layout pass.
     const SAFETY = 16;
     const neededHeight = Math.ceil(bottom - top + pad * 2) + SAFETY;
 
