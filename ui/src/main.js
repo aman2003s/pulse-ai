@@ -199,19 +199,20 @@ const controlsPanel = document.getElementById("controls-panel");
 expandBtn.addEventListener("click", async () => {
   const isCollapsed = controlsPanel.classList.contains("collapsed");
   if (isCollapsed) {
-    // Expanding: Resize window first to allocate height, then reveal panel — zero flicker
+    // 1. Grow OS window FIRST to target expanded size (forceCollapsed = false)
     await syncWindowHeight(settingsMenu.hidden ? false : true, false);
+    // 2. Reveal panel inside already-expanded window — zero clipping or flicker
     controlsPanel.classList.remove("collapsed");
     expandBtn.classList.remove("collapsed");
     expandBtn.setAttribute("aria-expanded", "true");
-    await syncWindowHeight();
   } else {
-    // Collapsing: Animate panel close first, then sync window height smoothly
+    // 1. Animate panel collapse first
     controlsPanel.classList.add("collapsed");
     expandBtn.classList.add("collapsed");
     expandBtn.setAttribute("aria-expanded", "false");
+    // 2. Shrink window frame after transition completes
     setTimeout(() => {
-      syncWindowHeight();
+      syncWindowHeight(settingsMenu.hidden ? false : true, true);
     }, 260);
   }
 });
@@ -240,19 +241,29 @@ let settingsMenuHeight = 0;
 })();
 
 // --- size the OS window to exactly the rendered content, then bottom-center it ---
-async function syncWindowHeight(menuOpen, forceCollapsed) {
+async function syncWindowHeight(menuOpen, targetCollapsedState) {
   try {
     const t = window.__TAURI__;
     if (!t || !t.window) return;
     const win = t.window.getCurrentWindow();
 
-    const isCollapsed = forceCollapsed !== undefined ? forceCollapsed : controlsPanel.classList.contains("collapsed");
-    const visibleRows = isCollapsed ? [pill] : [pill, controlsPanel];
-    const rects = visibleRows.map((el) => el.getBoundingClientRect());
-    let top = Math.min(...rects.map((r) => r.top));
-    const bottom = Math.max(...rects.map((r) => r.bottom));
+    const isCollapsed = targetCollapsedState !== undefined
+      ? targetCollapsedState
+      : controlsPanel.classList.contains("collapsed");
+
+    const pillRect = pill.getBoundingClientRect();
+    let top = pillRect.top;
+    let bottom = pillRect.bottom;
+
+    if (!isCollapsed) {
+      // Calculate true panel content height even if currently collapsed
+      const panelHeight = controlsPanel.scrollHeight || 75;
+      bottom = pillRect.bottom + 8 + panelHeight;
+    }
+
     if (menuOpen) top -= settingsMenuHeight + 8; // popup height + its own gap above the pill
-    const pad = parseFloat(getComputedStyle(document.body).paddingTop) || 0;
+
+    const pad = parseFloat(getComputedStyle(document.body).paddingTop) || 14;
     const SAFETY = 16;
     const neededHeight = Math.ceil(bottom - top + pad * 2) + SAFETY;
 
