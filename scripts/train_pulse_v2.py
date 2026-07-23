@@ -68,11 +68,12 @@ def place(clip):
     # OpenWakeWord's Google Speech Embedding model requires 76 melspec frames (760ms = 12160 samples)
     # of audio context before emitting each 80ms feature frame.
     RECEPTIVE_FIELD_SAMPLES = 12160
-    max_off = max(0, CLIP_LEN - len(clip))
-    off = rng.integers(0, max_off + 1)
+    # To extract a valid 16-frame window ending at f_end, f_end must be >= 16 (sample 32640).
+    min_off = max(0, 32640 - len(clip))
+    max_off = max(min_off, CLIP_LEN - len(clip))
+    off = rng.integers(min_off, max_off + 1)
     buf[off:off + len(clip)] = clip
-    # f_end is the feature frame index corresponding to when the spoken word actually finishes
-    f_end = max(16, (off + len(clip) - RECEPTIVE_FIELD_SAMPLES) // 1280)
+    f_end = (off + len(clip) - RECEPTIVE_FIELD_SAMPLES) // 1280
     f_start = max(0, (off - RECEPTIVE_FIELD_SAMPLES) // 1280)
     return (buf * 32767).astype(np.int16), f_start, f_end
 
@@ -179,7 +180,7 @@ print(f"windows: {len(X)} ({int(Y.sum())} positive)")
 # ── weighted BCE loss: correct for class imbalance automatically ─────────────
 n_pos = int(Y.sum())
 n_neg = len(Y) - n_pos
-pos_weight_val = n_neg / max(n_pos, 1)   # e.g. 8.0 if negatives outnumber positives 8:1
+pos_weight_val = max(1.5, n_neg / max(n_pos, 1))   # Never downweight positive speech loss
 print(f"Class balance: {n_pos} positive, {n_neg} negative  ->  pos_weight={pos_weight_val:.2f}")
 
 def run_training(lr=0.001, epochs=120):

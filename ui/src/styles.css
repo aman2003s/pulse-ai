@@ -30,10 +30,84 @@ body {
   backdrop-filter: blur(18px);
   -webkit-backdrop-filter: blur(18px);
   border: 1px solid rgba(255, 255, 255, 0.12);
-  transition: opacity 0.6s ease;
+  transition: opacity 0.6s ease, border-color 0.3s ease, box-shadow 0.3s ease;
 }
 #pill.faded { opacity: 0.35; }
 #pill:hover { opacity: 1; }
+
+/* ---- state glow: the pill's own border carries the same color as the orb ----
+   Same signal, twice as visible — useful across the whole width of the pill,
+   not just a 22px dot, and readable out of the corner of your eye. Colors and
+   which states pulse vs. hold static match the orb rules below exactly. */
+#pill.idle {
+  border-color: rgba(107, 114, 128, 0.4);
+  box-shadow: 0 0 10px rgba(107, 114, 128, 0.18);
+}
+#pill.listening {
+  border-color: rgba(56, 189, 248, 0.85);
+  box-shadow: 0 0 18px rgba(56, 189, 248, 0.45);
+  animation: pill-glow-listening 1.2s ease-in-out infinite;
+}
+#pill.thinking {
+  border-color: rgba(167, 139, 250, 0.85);
+  box-shadow: 0 0 18px rgba(167, 139, 250, 0.45);
+  animation: pill-glow-thinking 0.7s ease-in-out infinite;
+}
+#pill.acting {
+  border-color: rgba(251, 191, 36, 0.8);
+  box-shadow: 0 0 16px rgba(251, 191, 36, 0.4);
+}
+#pill.speaking {
+  border-color: rgba(52, 211, 153, 0.85);
+  box-shadow: 0 0 18px rgba(52, 211, 153, 0.45);
+  animation: pill-glow-speaking 1s ease-in-out infinite;
+}
+#pill.disconnected {
+  border-color: rgba(239, 68, 68, 0.7);
+  box-shadow: 0 0 14px rgba(239, 68, 68, 0.35);
+}
+@keyframes pill-glow-listening {
+  0%, 100% { border-color: rgba(56, 189, 248, 0.5);  box-shadow: 0 0 8px rgba(56, 189, 248, 0.25); }
+  50%       { border-color: rgba(56, 189, 248, 1);    box-shadow: 0 0 22px rgba(56, 189, 248, 0.6); }
+}
+@keyframes pill-glow-thinking {
+  0%, 100% { border-color: rgba(167, 139, 250, 0.5); box-shadow: 0 0 8px rgba(167, 139, 250, 0.25); }
+  50%       { border-color: rgba(167, 139, 250, 1);   box-shadow: 0 0 22px rgba(167, 139, 250, 0.6); }
+}
+@keyframes pill-glow-speaking {
+  0%, 100% { border-color: rgba(52, 211, 153, 0.5);  box-shadow: 0 0 8px rgba(52, 211, 153, 0.25); }
+  50%       { border-color: rgba(52, 211, 153, 1);    box-shadow: 0 0 22px rgba(52, 211, 153, 0.6); }
+}
+
+/* ---- wake-word training cue: glowing border on the existing pill ----
+   No new elements, no layout change — just the pill's own border pulsing
+   for as long as training is running, so it's impossible to miss. Declared
+   AFTER the state-glow rules above so it wins (equal specificity, source
+   order) over "acting" while both classes are present during training. */
+#pill.training {
+  border-color: rgba(167, 139, 250, 0.9);
+  box-shadow: 0 0 16px rgba(167, 139, 250, 0.55);
+  animation: pill-train-glow 1.6s ease-in-out infinite;
+}
+#pill.training-done {
+  border-color: rgba(52, 211, 153, 0.9);
+  box-shadow: 0 0 16px rgba(52, 211, 153, 0.55);
+  animation: none;
+  transition: border-color 0.4s ease, box-shadow 0.4s ease;
+}
+#pill.training-failed {
+  border-color: rgba(239, 68, 68, 0.9);
+  box-shadow: 0 0 16px rgba(239, 68, 68, 0.55);
+  animation: none;
+  transition: border-color 0.4s ease, box-shadow 0.4s ease;
+}
+@keyframes pill-train-glow {
+  0%, 100% { border-color: rgba(167, 139, 250, 0.5); box-shadow: 0 0 8px rgba(167, 139, 250, 0.3); }
+  50%       { border-color: rgba(167, 139, 250, 1);   box-shadow: 0 0 20px rgba(167, 139, 250, 0.7); }
+}
+@media (prefers-reduced-motion: reduce) {
+  #pill.listening, #pill.thinking, #pill.speaking, #pill.training { animation: none; }
+}
 
 /* ---- orb ---- */
 #orb {
@@ -81,7 +155,7 @@ body {
   text-overflow: ellipsis;
 }
 
-#settings-btn {
+#settings-btn, #close-btn {
   flex: none;
   background: none;
   border: none;
@@ -89,7 +163,10 @@ body {
   font-size: 16px;
   cursor: pointer;
 }
-#settings-btn:hover, #settings-btn:focus { color: #fff; }
+#settings-btn:hover, #settings-btn:focus,
+#close-btn:hover, #close-btn:focus { color: #fff; }
+#close-btn { font-size: 14px; }
+#close-btn:hover { color: #f87171; }
 
 /* ---- input row ---- */
 #input-row {
@@ -209,42 +286,3 @@ body {
   #detail-line { color: #ddd; }
 }
 
-/* ---- training progress bar ---- */
-/* Slim strip that appears just above the pill only while training is running.
-   Hidden by default [hidden attr]. Zero layout shift — it's fixed-position. */
-#train-bar {
-  position: fixed;
-  bottom: calc(100% - 28px); /* sits just above the quick-row */
-  left: 50%;
-  transform: translateX(-50%);
-  width: 90%;
-  padding: 5px 14px;
-  border-radius: 10px;
-  background: rgba(16, 20, 36, 0.88);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  border: 1px solid rgba(167, 139, 250, 0.35);
-  color: rgba(167, 139, 250, 0.95);
-  font-size: 11px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  text-align: center;
-  /* subtle pulsing left border to signal activity */
-  animation: train-pulse 2s ease-in-out infinite;
-  z-index: 20;
-}
-#train-bar[data-status="done"] {
-  border-color: rgba(52, 211, 153, 0.5);
-  color: rgba(52, 211, 153, 0.95);
-  animation: none;
-}
-#train-bar[data-status="failed"] {
-  border-color: rgba(239, 68, 68, 0.5);
-  color: rgba(239, 68, 68, 0.9);
-  animation: none;
-}
-@keyframes train-pulse {
-  0%, 100% { border-color: rgba(167, 139, 250, 0.25); }
-  50%       { border-color: rgba(167, 139, 250, 0.65); }
-}

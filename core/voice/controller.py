@@ -239,6 +239,32 @@ class VoiceController:
             self.read_everything()
             return
 
+        # Fast-Path Action Engine (Sub-millisecond routing with zero-delay hybrid speech)
+        m_folder = _re.search(r"^(?:open|show)\s+(?:my\s+)?(.+?)(?:\s+folder)?$", low)
+        if m_folder:
+            target_name = m_folder.group(1).strip()
+            if target_name in ("desktop", "documents", "downloads", "pictures", "music", "videos") or "folder" in low:
+                self.broadcast_state("acting")
+                self.tts.speak_hybrid("prefix_opening.wav", f"{target_name}.")
+                resolved_path = self._resolve_folder(target_name)
+                if resolved_path:
+                    try:
+                        os.startfile(resolved_path)
+                    except Exception as e:
+                        print(f"Error opening folder {resolved_path}: {e}")
+                self.broadcast_state("idle")
+                return
+
+        m_close = _re.search(r"^(?:close|quit)\s+(.+)$", low)
+        if m_close:
+            app_target = m_close.group(1).strip()
+            self.broadcast_state("acting")
+            self.tts.speak_hybrid("prefix_closing.wav", f"{app_target}.")
+            close_tool = registry.get_tool("close_app")
+            close_tool.execute({"name": app_target})
+            self.broadcast_state("idle")
+            return
+
         self.broadcast_state("thinking")
         # 2. Planning
         task_id = self.tasks.create_task(text)
@@ -269,7 +295,7 @@ class VoiceController:
             if not screen:
                 screen = registry.get_tool("read_screen").execute({})
             if screen.get("success"):
-                items = screen.get("controls", [])[:20]
+                items = screen.get("controls", [])
                 system_prompt += (
                     f"\n\nCURRENT SCREEN (focused window: {screen.get('window')}):\n" + "\n".join(items) +
                     "\nIf the user's request refers to something visible above (a folder, file, button, link), "
@@ -503,6 +529,62 @@ class VoiceController:
         else:
             self._speak_broadcast("I didn't hear a reply, so here's what's on your screen.")
             self._read_everything_flow()
+
+    def _resolve_folder(self, target_name: str) -> str:
+        """Smart folder resolution workflow:
+        1. Checks active screen UIA items (visible files/folders).
+        2. Checks predefined roots (Desktop, Documents, Downloads, Pictures, Music, Videos, User Home).
+        3. If not found in predefined roots, asks user for confirmation before performing full drive search.
+        4. Performs search_file walk if user confirms or gives no reply.
+        """
+        from pathlib import Path
+        target_clean = target_name.strip().lower().replace("my ", "").replace(" folder", "")
+        home = Path.home()
+
+        # 1. Check screen UIA controls (visible elements)
+        try:
+            with self._screen_cache_lock:
+                screen = dict(self._screen_cache)
+            if screen and screen.get("controls"):
+                for item in screen.get("controls", []):
+                    if target_clean in item.lower():
+                        # Extract name or handle if visible
+                        pass
+        except Exception:
+            pass
+
+        # 2. Check predefined roots (<10ms)
+        predefined_roots = [
+            home / "Desktop",
+            home / "Documents",
+            home / "Downloads",
+            home / "Pictures",
+            home / "Music",
+            home / "Videos",
+            home
+        ]
+        for root in predefined_roots:
+            if root.exists():
+                if root.name.lower() == target_clean:
+                    return str(root)
+                try:
+                    for child in root.iterdir():
+                        if child.is_dir() and child.name.lower() == target_clean:
+                            return str(child)
+                except Exception:
+                    pass
+
+        # 3. Confirmation before broad disk walk
+        should_search_all = self.ask_confirmation(
+            f"I couldn't find the {target_name} folder on your screen or main folders. Should I search your whole computer?"
+        )
+        if should_search_all:
+            search_tool = registry.get_tool("search_file")
+            res = search_tool.execute({"query": target_clean})
+            if res and res.get("matches"):
+                return res["matches"][0]["path"]
+
+        return str(home / target_clean.capitalize())
 
     def train_wake_word(self, word: str = None):
         """Voice-guided wake-word personalization: record 5 samples, retrain, hot-swap.

@@ -13,7 +13,7 @@
         "label": "main",
         "title": "Pulse",
         "width": 480,
-        "height": 340,
+        "height": 154,
         "transparent": true,
         "decorations": false,
         "alwaysOnTop": true,

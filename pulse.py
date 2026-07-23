@@ -47,7 +47,13 @@ class PulseOrchestrator:
         for port in (8081, 8082, 8083):  # M7.2: fall back if port is taken
             logger.info(f"Starting llama-server on port {port}...")
             self.llama_process = subprocess.Popen(
-                [SERVER_EXE, "-m", MODEL_PATH, "--port", str(port), "-c", "8192", "-ngl", "99"],
+                # --parallel 1: Pulse only ever has one active conversation at a time.
+                # Without this, llama-server defaults to multiple slots, each with its
+                # own separate KV cache — a "warm" cached prompt in one slot does nothing
+                # if the next request gets routed to a different, cold slot. Pinning to
+                # a single slot guarantees the same cache is reused every time (measured:
+                # ~0.8s warm vs ~14s cold for this app's real ~2800-token system prompt).
+                [SERVER_EXE, "-m", MODEL_PATH, "--port", str(port), "-c", "8192", "-ngl", "99", "--parallel", "1"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )

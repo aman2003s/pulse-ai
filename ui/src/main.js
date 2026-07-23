@@ -19,15 +19,20 @@ const STATE_LABELS = {
   acting: "Working on it…",
   speaking: "Speaking…",
 };
+const STATE_CLASSES = ["idle", "listening", "thinking", "acting", "speaking", "disconnected"];
 
 let ws = null;
 let reconnectDelay = 500;   // start fast — backend usually ready in 3-8s
 let reconnectAttempts = 0;  // track how many times we've tried
 const FAST_RETRY_LIMIT = 20; // try every 500ms for up to 10s before slowing down
 let fadeTimer = null;
+let trainingDoneTimer = null;
 
 function setState(state) {
-  pill.className = state;
+  // Only swap the state class — a plain `className =` overwrite would also wipe
+  // the "training" glow class applied independently during wake-word training.
+  pill.classList.remove(...STATE_CLASSES);
+  pill.classList.add(state);
   statusLine.textContent = STATE_LABELS[state] || state;
   clearTimeout(fadeTimer);
   pill.classList.remove("faded");
@@ -95,15 +100,22 @@ function connect() {
         a11yChk.checked = msg.feedback_mode === "Guided" && !!msg.narrate && !!msg.typing_echo;
         break;
       case "training_progress": {
-        const bar = document.getElementById("train-bar");
+        // Sole cue: glowing border on the existing pill + the text printed into
+        // detail-line (an element that's always there anyway) — no separate element,
+        // so no extra height is ever reserved for something that isn't visible.
+        clearTimeout(trainingDoneTimer);
         if (msg.status === "started" || msg.status === "running") {
-          bar.hidden = false;
-          bar.textContent = msg.text;
+          pill.classList.add("training");
+          pill.classList.remove("training-done", "training-failed");
+          detailLine.textContent = msg.text;
         } else {
-          // done or failed — show final message then fade out
-          bar.textContent = msg.text;
-          bar.dataset.status = msg.status;
-          setTimeout(() => { bar.hidden = true; bar.dataset.status = ""; }, 6000);
+          // done or failed — solid color hold, then fade back to normal
+          pill.classList.remove("training");
+          pill.classList.add(msg.status === "failed" ? "training-failed" : "training-done");
+          detailLine.textContent = msg.text;
+          trainingDoneTimer = setTimeout(() => {
+            pill.classList.remove("training-done", "training-failed");
+          }, 6000);
         }
         break;
       }
@@ -147,14 +159,30 @@ document.addEventListener("keydown", (e) => {
 document.getElementById("orb").addEventListener("click", () => {
   send({ type: "wake" });
 });
+document.getElementById("close-btn").addEventListener("click", () => {
+  // Closes just this overlay window — Pulse core (and wake-word listening) keeps
+  // running in the background; run.bat brings the window back without restarting it.
+  const t = window.__TAURI__;
+  if (t && t.window) t.window.getCurrentWindow().close();
+});
 function closeSettingsMenu() {
+  if (settingsMenu.hidden) return;
+  // Hide BEFORE shrinking — the window staying briefly oversized is invisible
+  // (transparent), but showing the popup before the window has grown to fit it
+  // is what caused the visible flicker (clipped for a frame, then snaps).
   settingsMenu.hidden = true;
   settingsBtn.setAttribute("aria-expanded", "false");
+  syncWindowHeight(false);
 }
-settingsBtn.addEventListener("click", (e) => {
+settingsBtn.addEventListener("click", async (e) => {
   e.stopPropagation();
-  settingsMenu.hidden = !settingsMenu.hidden;
-  settingsBtn.setAttribute("aria-expanded", String(!settingsMenu.hidden));
+  if (settingsMenu.hidden) {
+    await syncWindowHeight(true);  // grow to fit FIRST, then reveal — no clipped frame
+    settingsMenu.hidden = false;
+    settingsBtn.setAttribute("aria-expanded", "true");
+  } else {
+    closeSettingsMenu();
+  }
 });
 document.addEventListener("click", (e) => {
   if (!settingsMenu.hidden && !settingsMenu.contains(e.target) && e.target !== settingsBtn) {
@@ -179,12 +207,42 @@ document.getElementById("mic-select").addEventListener("change", (e) => {
   if (e.target.value !== "") send({ type: "set_config", key: "mic_device", value: e.target.value });
 });
 
-// --- position window bottom-center (Tauri only; no-op in a plain browser) ---
-async function positionWindow() {
+// Measure the settings popup's natural height ONCE, synchronously, before first
+// paint (toggling `hidden` on and back off within a single script tick never
+// paints the in-between frame). This means opening it can resize the window to
+// fit BEFORE the popup is revealed, instead of "show, measure, then resize" —
+// which is what caused the visible clip-then-snap flicker.
+let settingsMenuHeight = 0;
+(function measureSettingsMenu() {
+  settingsMenu.hidden = false;
+  settingsMenuHeight = settingsMenu.getBoundingClientRect().height;
+  settingsMenu.hidden = true;
+})();
+
+// --- size the OS window to exactly the rendered content, then bottom-center it ---
+// The window background is transparent, but the OS window rectangle isn't — any
+// area taller than what's actually drawn is invisible AND still eats clicks meant
+// for whatever's behind it. So height is never hand-picked: it's measured from the
+// real DOM every time visible content changes.
+async function syncWindowHeight(menuOpen) {
   try {
     const t = window.__TAURI__;
     if (!t || !t.window) return;
     const win = t.window.getCurrentWindow();
+
+    const rows = [pill, document.getElementById("input-row"), document.getElementById("quick-row")];
+    const rects = rows.map((el) => el.getBoundingClientRect());
+    let top = Math.min(...rects.map((r) => r.top));
+    const bottom = Math.max(...rects.map((r) => r.bottom));
+    if (menuOpen) top -= settingsMenuHeight + 8; // popup height + its own gap above the pill
+    const pad = parseFloat(getComputedStyle(document.body).paddingTop) || 0;
+    // Small cushion: without it, the top pixel or two of the pill was getting clipped —
+    // rounding differences between our measurement and WebView2's actual layout pass.
+    const SAFETY = 8;
+    const neededHeight = Math.ceil(bottom - top + pad * 2) + SAFETY;
+
+    await win.setSize(new t.window.LogicalSize(480, neededHeight));
+
     const monitor = await t.window.currentMonitor();
     if (!monitor) return;
     const size = await win.outerSize();
@@ -192,9 +250,9 @@ async function positionWindow() {
     const y = Math.round(monitor.position.y + monitor.size.height - size.height - 80);
     await win.setPosition(new t.window.PhysicalPosition(x, y));
   } catch (e) {
-    console.warn("Window positioning skipped:", e);
+    console.warn("Window height sync skipped:", e);
   }
 }
 
-positionWindow();
+syncWindowHeight(false);
 connect();

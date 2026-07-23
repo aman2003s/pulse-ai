@@ -74,10 +74,14 @@ save_pcm("beep_bad.wav", np.concatenate([
     fade(sine(440, 0.15)),
 ]))
 
-# Live-app wake acknowledgement — two crisp high beeps
+# Live-app wake acknowledgement — the one sound users hear on every single wake,
+# so it needs to actually be heard. The old version (two identical 80ms beeps at
+# amplitude 0.6) was reported too quiet to notice. This is a louder ascending
+# two-note chime (like Google/Alexa's "I heard you" tone — a rising interval reads
+# as confirmation) at near-max amplitude, still short enough to feel instant.
 save_pcm("ack.wav", np.concatenate([
-    fade(sine(1047, 0.08)), gap(0.05),
-    fade(sine(1047, 0.08)),
+    fade(sine(784,  0.13, amplitude=0.9)), gap(0.02),
+    fade(sine(1047, 0.16, amplitude=0.9)),
 ]))
 
 
@@ -111,6 +115,17 @@ kokoro_to_wav("Again, say pulse.",
 
 kokoro_to_wav("Training complete. All samples collected.",
               "prompt_done.wav")
+
+kokoro_to_wav("Training complete. Pulse is now your trained wake word.",
+              "prompt_trained.wav")
+
+print("\nSynthesising fast-path prefix assets with Kokoro...")
+kokoro_to_wav("Opening ", "prefix_opening.wav")
+kokoro_to_wav("I've opened ", "prefix_opened.wav")
+kokoro_to_wav("Searching for ", "prefix_searching.wav")
+kokoro_to_wav("I found ", "prefix_found.wav")
+kokoro_to_wav("Closing ", "prefix_closing.wav")
+kokoro_to_wav("Reading ", "prefix_reading.wav")
 
 
 # ── 3. Copy ack.wav to models/ack.wav for backward compat with capture.py ─────

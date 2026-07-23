@@ -28,17 +28,45 @@ class WakeListener:
             # openwakeword expects 16kHz, 1-channel, int16
             audio = indata.flatten()
             prediction = self.owwModel.predict(audio)
-            
+
             # Predict returns a dict: {"hey_jarvis_v0.1": score}
             # Match the prefix or exact name
-            score = 0.0
+            raw_score = 0.0
             for key, val in prediction.items():
                 if self.model_name in key:
-                    score = val
+                    raw_score = val
                     break
-                    
+
+            # Decide off the PEAK score over a short sliding window (~240ms), not a single
+            # 80ms frame in isolation. A genuine wake word's confidence ramps up over a
+            # couple of frames — a single frame can dip just under threshold by chance and
+            # cause a missed detection even though the word was said correctly. This is the
+            # same smoothing production keyword-spotters (Porcupine, Alexa) use instead of
+            # frame-by-frame decisions.
+            window = getattr(self, '_score_window', None)
+            if window is None:
+                from collections import deque
+                window = self._score_window = deque(maxlen=3)
+            window.append(raw_score)
+            score = max(window)
+
             speaking = self.is_speaking_fn()
             threshold = 0.93 if speaking else 0.3
+
+            # TEMPORARY diagnostic — same "watch it live" approach that found the training
+            # bugs. Reusing this SAME callback/stream (not a second parallel InputStream,
+            # which would risk the exact concurrent-stream conflict fixed earlier) to show
+            # both raw mic energy (proves audio is actually reaching Pulse at all) and the
+            # model's score, so we can tell "no audio" apart from "model isn't detecting it".
+            rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+            now_hb = time.time()
+            if now_hb - getattr(self, '_last_heartbeat', 0) > 1.0:
+                self._last_heartbeat = now_hb
+                print(f"[mic heartbeat] rms={rms:.1f}")
+            if raw_score > 0.05 or rms > 300:
+                print(f"[wake score] raw={raw_score:.3f} smoothed={score:.3f} "
+                      f"threshold={threshold:.2f} speaking={speaking} rms={rms:.1f}")
+
             if score > threshold:
                 # While Pulse is talking, require the score to stay high for 2 consecutive
                 # 80ms frames (not just one spike) before treating it as a real interrupt —
@@ -55,7 +83,13 @@ class WakeListener:
             else:
                 self._high_streak = 0
         except Exception as e:
-            pass # ignore audio thread exceptions to prevent crash
+            # Never crash the audio thread on a bad frame, but don't go fully silent
+            # either — a callback that's erroring every frame would otherwise look
+            # identical to "detection just isn't triggering," with zero evidence either way.
+            now = time.time()
+            if now - getattr(self, '_last_err_print', 0) > 5.0:
+                self._last_err_print = now
+                print(f"WakeListener callback error: {e}")
 
     def start(self):
         if self.is_running:

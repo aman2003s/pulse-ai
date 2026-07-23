@@ -10,10 +10,14 @@
   <div id="pill" class="idle" data-tauri-drag-region>
     <button id="orb" aria-label="Wake Pulse and start listening" title="Click to wake Pulse (same as saying 'Pulse')"></button>
     <div id="content" data-tauri-drag-region>
+      <!-- Training progress (and every other status) prints here — the pill's own
+           glowing border is the progress indicator, so no separate element/height
+           is needed just to show that training is running. -->
       <div id="status-line" aria-live="polite">Connecting to Pulse…</div>
       <div id="detail-line" aria-live="polite"></div>
     </div>
     <button id="settings-btn" aria-label="Settings" aria-haspopup="true" aria-expanded="false" title="Settings">⚙</button>
+    <button id="close-btn" aria-label="Close Pulse window" title="Close">✕</button>
 
     <div id="settings-menu" role="menu" hidden>
       <div class="s-row">
@@ -42,9 +46,6 @@
     </select>
     <select id="mic-select" aria-label="Microphone"><option value="">Default mic</option></select>
   </div>
-
-  <!-- training progress bar: only visible during wake-word training -->
-  <div id="train-bar" hidden></div>
 
   <div id="toast" role="alert" hidden></div>
 

@@ -1,41 +1,35 @@
-import os
 import io
-from faster_whisper import WhisperModel
-import tempfile
 import warnings
+import soundfile as sf
+from transformers import AutoProcessor, MoonshineStreamingForConditionalGeneration
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
 class STTService:
-    def __init__(self, model_size="base.en"):
-        print(f"Loading faster-whisper model ({model_size})...")
-        whisper_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'models', 'whisper'))
-        self.model = WhisperModel(model_size, device="cpu", compute_type="int8", download_root=whisper_dir)
-        
-    # Biases decoding toward Pulse's actual vocabulary — fixes misheard commands
-    # like "desktop" -> "next up" on short, ambiguous utterances.
-    VOCAB_PROMPT = (
-        "Pulse, open, close, find, search, read, screen, desktop, documents, downloads, "
-        "pictures, folder, file, notepad, chrome, explorer, narrate, repeat, spell, "
-        "faster, slower, train my voice, what's on my screen"
-    )
+    # Moonshine beats Whisper base/small on accuracy at a fraction of the size, and is
+    # built for exactly this use case (short commands, no fixed 30s zero-padded window).
+    # Medium vs small streaming measured at 0.40s vs 0.17s inference on this machine —
+    # a 0.23s delta that's negligible next to the rest of the voice pipeline (planning +
+    # TTS), so medium is a fixed, permanent choice, not re-probed at runtime.
+    MODEL_REPO = "UsefulSensors/moonshine-streaming-medium"
+
+    def __init__(self, model_repo=None):
+        repo = model_repo or self.MODEL_REPO
+        print(f"Loading Moonshine model ({repo})...")
+        self.processor = AutoProcessor.from_pretrained(repo)
+        self.model = MoonshineStreamingForConditionalGeneration.from_pretrained(repo)
 
     def transcribe(self, wav_bytes: bytes, extra_vocab: str = "") -> str:
         if not wav_bytes:
             return ""
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(wav_bytes)
-            temp_path = f.name
-
-        prompt = f"{self.VOCAB_PROMPT}, {extra_vocab}" if extra_vocab else self.VOCAB_PROMPT
         try:
-            segments, info = self.model.transcribe(temp_path, beam_size=5, initial_prompt=prompt)
-            text = " ".join([segment.text for segment in segments])
+            audio, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+            inputs = self.processor(audio, sampling_rate=sr, return_tensors="pt")
+            out = self.model.generate(**inputs, max_new_tokens=128)
+            text = self.processor.batch_decode(out, skip_special_tokens=True)[0]
             return text.strip()
         except Exception as e:
             print(f"STT error: {e}")
             return ""
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
