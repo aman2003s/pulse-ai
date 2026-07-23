@@ -14,7 +14,7 @@ body {
   align-items: center;
   justify-content: flex-end;
   gap: 8px;
-  padding: 12px;
+  padding: 14px;
 }
 
 /* ---- main pill ---- */
@@ -35,69 +35,69 @@ body {
 #pill.faded { opacity: 0.35; }
 #pill:hover { opacity: 1; }
 
-/* ---- state glow: synchronized with orb animation, contained within padding margin ---- */
+/* ---- state glow: expanded rich aura expanding up to 13px-14px across padding ---- */
 #pill.idle {
   border-color: rgba(107, 114, 128, 0.4);
-  box-shadow: 0 0 6px rgba(107, 114, 128, 0.18);
+  box-shadow: 0 0 8px rgba(107, 114, 128, 0.22);
 }
 #pill.listening {
   border-color: rgba(56, 189, 248, 0.85);
-  box-shadow: 0 0 8px rgba(56, 189, 248, 0.4);
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.5);
   animation: pill-glow-listening 1.2s ease-in-out infinite;
 }
 #pill.thinking {
   border-color: rgba(167, 139, 250, 0.85);
-  box-shadow: 0 0 8px rgba(167, 139, 250, 0.4);
+  box-shadow: 0 0 10px rgba(167, 139, 250, 0.5);
   animation: pill-glow-thinking 0.7s ease-in-out infinite;
 }
 #pill.acting {
   border-color: rgba(251, 191, 36, 0.8);
-  box-shadow: 0 0 8px rgba(251, 191, 36, 0.4);
+  box-shadow: 0 0 10px rgba(251, 191, 36, 0.5);
 }
 #pill.speaking {
   border-color: rgba(52, 211, 153, 0.85);
-  box-shadow: 0 0 8px rgba(52, 211, 153, 0.4);
+  box-shadow: 0 0 10px rgba(52, 211, 153, 0.5);
   animation: pill-glow-speaking 1s ease-in-out infinite;
 }
 #pill.disconnected {
   border-color: rgba(239, 68, 68, 0.7);
-  box-shadow: 0 0 8px rgba(239, 68, 68, 0.35);
+  box-shadow: 0 0 10px rgba(239, 68, 68, 0.4);
 }
 
 @keyframes pill-glow-listening {
-  0%, 100% { border-color: rgba(56, 189, 248, 0.4);  box-shadow: 0 0 4px rgba(56, 189, 248, 0.2); }
-  50%       { border-color: rgba(56, 189, 248, 0.95); box-shadow: 0 0 10px rgba(56, 189, 248, 0.5); }
+  0%, 100% { border-color: rgba(56, 189, 248, 0.45); box-shadow: 0 0 5px rgba(56, 189, 248, 0.25); }
+  50%       { border-color: rgba(56, 189, 248, 1);    box-shadow: 0 0 13px rgba(56, 189, 248, 0.7); }
 }
 @keyframes pill-glow-thinking {
-  0%, 100% { border-color: rgba(167, 139, 250, 0.4); box-shadow: 0 0 4px rgba(167, 139, 250, 0.2); }
-  50%       { border-color: rgba(167, 139, 250, 0.95); box-shadow: 0 0 10px rgba(167, 139, 250, 0.5); }
+  0%, 100% { border-color: rgba(167, 139, 250, 0.45); box-shadow: 0 0 5px rgba(167, 139, 250, 0.25); }
+  50%       { border-color: rgba(167, 139, 250, 1);   box-shadow: 0 0 13px rgba(167, 139, 250, 0.7); }
 }
 @keyframes pill-glow-speaking {
-  0%, 100% { border-color: rgba(52, 211, 153, 0.4);  box-shadow: 0 0 4px rgba(52, 211, 153, 0.2); }
-  50%       { border-color: rgba(52, 211, 153, 0.95); box-shadow: 0 0 10px rgba(52, 211, 153, 0.5); }
+  0%, 100% { border-color: rgba(52, 211, 153, 0.45);  box-shadow: 0 0 5px rgba(52, 211, 153, 0.25); }
+  50%       { border-color: rgba(52, 211, 153, 1);    box-shadow: 0 0 13px rgba(52, 211, 153, 0.7); }
 }
 
 /* ---- wake-word training cue ---- */
 #pill.training {
   border-color: rgba(167, 139, 250, 0.9);
-  box-shadow: 0 0 8px rgba(167, 139, 250, 0.5);
+  box-shadow: 0 0 10px rgba(167, 139, 250, 0.55);
   animation: pill-train-glow 1.6s ease-in-out infinite;
 }
 #pill.training-done {
   border-color: rgba(52, 211, 153, 0.9);
-  box-shadow: 0 0 8px rgba(52, 211, 153, 0.5);
+  box-shadow: 0 0 10px rgba(52, 211, 153, 0.55);
   animation: none;
   transition: border-color 0.4s ease, box-shadow 0.4s ease;
 }
 #pill.training-failed {
   border-color: rgba(239, 68, 68, 0.9);
-  box-shadow: 0 0 8px rgba(239, 68, 68, 0.5);
+  box-shadow: 0 0 10px rgba(239, 68, 68, 0.55);
   animation: none;
   transition: border-color 0.4s ease, box-shadow 0.4s ease;
 }
 @keyframes pill-train-glow {
-  0%, 100% { border-color: rgba(167, 139, 250, 0.4); box-shadow: 0 0 4px rgba(167, 139, 250, 0.25); }
-  50%       { border-color: rgba(167, 139, 250, 1);   box-shadow: 0 0 10px rgba(167, 139, 250, 0.6); }
+  0%, 100% { border-color: rgba(167, 139, 250, 0.45); box-shadow: 0 0 5px rgba(167, 139, 250, 0.3); }
+  50%       { border-color: rgba(167, 139, 250, 1);    box-shadow: 0 0 13px rgba(167, 139, 250, 0.75); }
 }
 @media (prefers-reduced-motion: reduce) {
   #pill.listening, #pill.thinking, #pill.speaking, #pill.training { animation: none; }

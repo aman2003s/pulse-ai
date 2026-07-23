@@ -239,7 +239,7 @@ async function syncWindowHeight(menuOpen) {
     const pad = parseFloat(getComputedStyle(document.body).paddingTop) || 0;
     // Small cushion: without it, the top pixel or two of the pill was getting clipped —
     // rounding differences between our measurement and WebView2's actual layout pass.
-    const SAFETY = 8;
+    const SAFETY = 16;
     const neededHeight = Math.ceil(bottom - top + pad * 2) + SAFETY;
 
     await win.setSize(new t.window.LogicalSize(480, neededHeight));
