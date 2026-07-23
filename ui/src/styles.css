@@ -14,7 +14,7 @@ body {
   align-items: center;
   justify-content: flex-end;
   gap: 8px;
-  padding: 10px;
+  padding: 12px;
 }
 
 /* ---- main pill ---- */
@@ -207,13 +207,7 @@ body {
   align-items: center;
   gap: 8px;
   cursor: pointer;
-  padding: 3px 8px;
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.06);
-  transition: background 0.2s ease;
-}
-#a11y-row:hover {
-  background: rgba(255, 255, 255, 0.12);
+  padding: 3px 4px;
 }
 
 /* ---- sleek toggle switch button ---- */
