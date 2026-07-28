@@ -78,7 +78,7 @@ Under the hood, this is a real reason → act → observe → re-plan loop: Puls
 
 ## Screenshots
 
-Screenshots and a short demo GIF are being captured for this release — see [`docs/SCREENSHOTS_CHECKLIST.md`](docs/SCREENSHOTS_CHECKLIST.md) for exactly what's needed if you'd like to help. Once captured they'll replace this section.
+A short launch demo is available at [`docs/assets/pulse_launch_demo.mp4`](docs/assets/pulse_launch_demo.mp4). Static screenshots of the individual UI states are still needed — see [`docs/SCREENSHOTS_CHECKLIST.md`](docs/SCREENSHOTS_CHECKLIST.md) for exactly what's needed if you'd like to help.
 
 ## Architecture
 
