@@ -28,4 +28,4 @@ Not without permission — see [License](../README.md#license). It's free for pe
 See [`CONTRIBUTING.md`](../CONTRIBUTING.md). Bug reports and small, well-scoped fixes are the most valuable thing right now.
 
 **Why "Pulse"?**
-Not documented anywhere formally — if you're curious about the name's story, ask in [Discussions](../../../discussions).
+Not documented anywhere formally — if you're curious about the name's story, ask in [Discussions](https://github.com/aman2003s/pulse-ai/discussions).

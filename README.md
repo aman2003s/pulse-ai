@@ -1,5 +1,3 @@
-<div align="center">
-
 # Pulse
 
 **Control your computer through natural conversation.**
@@ -8,8 +6,6 @@
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D6.svg)](#installation)
 [![Status](https://img.shields.io/badge/status-early%20preview-orange.svg)](#known-limitations)
 [![Contributions welcome](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](CONTRIBUTING.md)
-
-</div>
 
 ---
 
@@ -178,7 +174,7 @@ Read this before filing "it doesn't work" — some of these are real, open probl
 - **Vision fallback is a real capability, not infallible.** It can misread low-contrast or very small on-screen elements, same as any vision model.
 - **No sandboxing.** Pulse automates your real desktop through the same UI-Automation APIs a screen reader uses — it can click, type, and save files for real. Confirmation is required for sensitive actions, but review what you ask it to do.
 
-Found something not listed here? [Open an issue](../../issues/new/choose) — that's exactly what this release is for.
+Found something not listed here? [Open an issue](https://github.com/aman2003s/pulse-ai/issues/new/choose) — that's exactly what this release is for.
 
 ## Contributing
 
@@ -192,7 +188,7 @@ Pulse's planning, speech recognition, and text-to-speech run on local models on 
 
 ## Accessibility
 
-Accessibility is not a feature layered on top of Pulse — it's the reason Pulse exists. It's built for people with visual impairments or limited mobility to operate a full Windows desktop by voice, and tuned (via [Superhero Mode](#-superhero-mode) and configurable feedback levels) to keep users continuously informed rather than leaving them guessing what's happening. If something about Pulse gets in the way of that goal, please [open an issue](../../issues/new/choose) — accessibility reports get priority.
+Accessibility is not a feature layered on top of Pulse — it's the reason Pulse exists. It's built for people with visual impairments or limited mobility to operate a full Windows desktop by voice, and tuned (via [Superhero Mode](#-superhero-mode) and configurable feedback levels) to keep users continuously informed rather than leaving them guessing what's happening. If something about Pulse gets in the way of that goal, please [open an issue](https://github.com/aman2003s/pulse-ai/issues/new/choose) — accessibility reports get priority.
 
 ## Built with Open Technologies
 
@@ -204,8 +200,4 @@ Pulse is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) — 
 
 ---
 
-<div align="center">
-
 © 2026 Pulse Project
-
-</div>

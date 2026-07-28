@@ -6,8 +6,8 @@ Please read [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) before participating.
 
 ## Ways to contribute
 
-- **Report a bug** — [open an issue](../../issues/new/choose) using the bug report template. Include exactly what you asked Pulse to do, what happened instead, and your Windows version.
-- **Suggest an idea** — [open an issue](../../issues/new/choose) using the feature request template. Check [Known Limitations](README.md#known-limitations) and the [Roadmap](README.md#roadmap) first — it may already be tracked.
+- **Report a bug** — [open an issue](https://github.com/aman2003s/pulse-ai/issues/new/choose) using the bug report template. Include exactly what you asked Pulse to do, what happened instead, and your Windows version.
+- **Suggest an idea** — [open an issue](https://github.com/aman2003s/pulse-ai/issues/new/choose) using the feature request template. Check [Known Limitations](README.md#known-limitations) and the [Roadmap](README.md#roadmap) first — it may already be tracked.
 - **Fix something** — see [Good first contributions](#good-first-contributions) below.
 - **Improve docs** — typos, unclear setup steps, and missing detail are all fair game.
 

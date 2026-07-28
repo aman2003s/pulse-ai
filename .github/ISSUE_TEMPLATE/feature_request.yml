@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Before filing, please check the [Roadmap](../../README.md#roadmap) — it may already be planned. Pulse's philosophy is "small, well-tested features" over breadth, so the strongest requests are specific and grounded in a real task you were trying to do.
+        Before filing, please check the [Roadmap](https://github.com/aman2003s/pulse-ai/blob/main/README.md#roadmap) — it may already be planned. Pulse's philosophy is "small, well-tested features" over breadth, so the strongest requests are specific and grounded in a real task you were trying to do.
 
   - type: textarea
     id: problem
