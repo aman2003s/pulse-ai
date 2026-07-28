@@ -29,7 +29,7 @@ class ToolExecutor:
         result = {}
         error = None
         
-        # Run tool with 10s timeout using a thread
+        # Run tool with a per-tool timeout using a thread (see Tool.timeout_s).
         def target():
             nonlocal result, error
             try:
@@ -37,14 +37,14 @@ class ToolExecutor:
             except Exception as e:
                 logger.error(f"Error executing {tool_name}: {e}")
                 error = str(e)
-                
+
         thread = threading.Thread(target=target)
         thread.start()
-        thread.join(timeout=10.0)
-        
+        thread.join(timeout=tool.timeout_s)
+
         if thread.is_alive():
             # Timeout
-            return {"error": f"Tool {tool_name} timed out after 10 seconds."}, "error"
+            return {"error": f"Tool {tool_name} timed out after {tool.timeout_s:.0f} seconds."}, "error"
             
         if error:
             return {"error": error}, "error"

@@ -16,7 +16,28 @@ def init_db():
     conn = get_db()
     with conn:
         conn.executescript(schema)
+    migrate_db(conn)
     conn.close()
+
+def migrate_db(conn=None):
+    """Additive, idempotent column migrations for DBs created before a column
+    existed — CREATE TABLE IF NOT EXISTS in schema.sql only helps brand-new DBs;
+    an existing tasks table needs ALTER TABLE to actually gain new columns.
+    Safe to call on every startup: SQLite has no 'ADD COLUMN IF NOT EXISTS',
+    so a "duplicate column" failure here is the normal, expected case."""
+    own_conn = conn is None
+    conn = conn or get_db()
+    for stmt in (
+        "ALTER TABLE tasks ADD COLUMN pending_slot TEXT",
+        "ALTER TABLE tasks ADD COLUMN pending_question TEXT",
+    ):
+        try:
+            with conn:
+                conn.execute(stmt)
+        except Exception:
+            pass
+    if own_conn:
+        conn.close()
 
 if __name__ == "__main__":
     init_db()

@@ -53,3 +53,39 @@ class TaskManager:
         conn = get_db()
         rows = conn.execute("SELECT * FROM tasks WHERE status = 'pending'").fetchall()
         return [dict(r) for r in rows]
+
+    def park_task(self, task_id: str, slot: str, question: str):
+        """Parks a task awaiting one missing piece of info (see ask_slot). Only one
+        task can be parked at a time by design — enforced here by superseding any
+        other still-parked task, not just left to callers/queries to sort out.
+        Speaking the "newest wins" notice to the user is still the caller's job."""
+        conn = get_db()
+        with conn:
+            conn.execute(
+                "UPDATE tasks SET status = 'superseded' WHERE status = 'waiting_input' AND id != ?",
+                (task_id,)
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'waiting_input', pending_slot = ?, pending_question = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (slot, question, task_id)
+            )
+
+    def get_parked_task(self) -> Optional[Dict[str, Any]]:
+        """The single most-recently-parked task, if any. 'Newest wins' is enforced
+        at park time (only one can be waiting_input — parking a new one implicitly
+        supersedes any prior one, matching the one-parked-task-at-a-time design)."""
+        conn = get_db()
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE status = 'waiting_input' ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+    def unpark_task(self, task_id: str, new_status: str = "in_progress"):
+        conn = get_db()
+        with conn:
+            conn.execute(
+                "UPDATE tasks SET status = ?, pending_slot = NULL, pending_question = NULL, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (new_status, task_id)
+            )
