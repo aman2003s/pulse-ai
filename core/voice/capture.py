@@ -8,6 +8,8 @@ import os
 import threading
 import warnings
 
+from core.paths import models_dir
+
 # Suppress warnings from torch hub
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -21,8 +23,8 @@ class CapturePipeline:
             force_reload=False
         )
         # Prefer pre-baked asset (generate_assets.py), fall back to legacy Kokoro-generated ack.wav
-        assets_ack = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'models', 'assets', 'ack.wav'))
-        legacy_ack = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'models', 'ack.wav'))
+        assets_ack = os.path.join(models_dir(), 'assets', 'ack.wav')
+        legacy_ack = os.path.join(models_dir(), 'ack.wav')
         self.earcon_path = assets_ack if os.path.exists(assets_ack) else legacy_ack
         self._abort = threading.Event()
 

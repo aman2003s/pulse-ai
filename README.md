@@ -6,13 +6,16 @@
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D6.svg)](#installation)
 [![Status](https://img.shields.io/badge/status-early%20preview-orange.svg)](#known-limitations)
 [![Contributions welcome](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![Landing page](https://img.shields.io/badge/website-pulse--liart--phi--64.vercel.app-38bdf8.svg)](https://pulse-liart-phi-64.vercel.app/)
+
+**[🌐 Visit the landing page](https://pulse-liart-phi-64.vercel.app/)** — see the interface, the pitch, and the demo video in one place.
 
 ---
 
 Pulse is a **local, voice-first AI computer companion**. Say "Pulse," describe what you want to do, and Pulse understands your intent, performs the task on your actual desktop, and keeps you informed the entire time — no cloud round-trip, no account, no shortcuts to memorize.
 
 ```
-You:   "Pulse, open Notepad and write 'how are you all?'"
+You:   "Pulse, open Notepad and write 'hello, how are you'"
 Pulse: "Opening Notepad. Typing that in now. Done."
 ```
 
@@ -102,7 +105,11 @@ Full detail — component responsibilities, the command-processing loop, the too
 
 ## Installation
 
-Pulse is Windows-only today. A packaged one-click installer is in progress (see [Roadmap](#roadmap)) — for now, run it from source:
+Pulse is Windows-only today.
+
+**Packaged installer**: build one yourself with `cd ui/src-tauri && cargo tauri build` (needs `cargo install tauri-cli --version "^2"` first) — this produces a single `.exe` that installs the full app (UI + backend), no admin rights needed. First launch downloads the model weights (~6GB) automatically; see [`docs/INSTALLER_PLAN.md`](docs/INSTALLER_PLAN.md) for exactly what's verified and what's still rough (no download-progress UI yet, wake-word retraining stays source-only). A prebuilt release isn't published yet — see the repo's [Releases](https://github.com/aman2003s/pulse-ai/releases) page.
+
+**Run from source** (the tested, complete path today):
 
 1. **Clone the repo**
    ```bash
@@ -132,7 +139,7 @@ Full step-by-step instructions, hardware expectations, and troubleshooting live 
 Once Pulse is running:
 
 1. Say **"Pulse"** and wait for it to respond.
-2. Say what you want, in plain language — e.g. *"Open Notepad and write 'how are you all?'"*
+2. Say what you want, in plain language — e.g. *"Open Notepad and write 'hello, how are you'"*
 3. Listen (or read the overlay) as Pulse narrates each step.
 4. If Pulse needs a detail it doesn't have (a filename, a location), it'll ask — just answer normally.
 
@@ -157,7 +164,8 @@ Built incrementally, with each feature tested against real, messy, real-world ap
 **Current foundation**: voice interaction, wake word, local AI planning, on-screen understanding (text + visual fallback), multi-step task execution with self-correction, accessibility-tuned feedback.
 
 **Near-term**:
-- Packaged one-click Windows installer — see [`docs/INSTALLER_PLAN.md`](docs/INSTALLER_PLAN.md) for current status
+- A published, downloadable installer release (buildable from source today — see [Installation](#installation) — but not yet cut as a GitHub Release)
+- A first-run download-progress UI for the installer's one-time ~6GB model fetch
 - Optional launch-at-startup
 - Broader, more reliable app coverage (this is where your bug reports matter most)
 
@@ -168,7 +176,7 @@ Built incrementally, with each feature tested against real, messy, real-world ap
 Read this before filing "it doesn't work" — some of these are real, open problems, not surprises:
 
 - **Windows only.** No macOS/Linux support yet.
-- **Run-from-source only.** No installer yet — see [Roadmap](#roadmap).
+- **No published installer release yet.** A packaged installer is buildable from source (see [Installation](#installation)) and works end-to-end, but isn't yet published as a downloadable release — see [Roadmap](#roadmap).
 - **Quality depends on the local model.** Planning runs on a small, locally-hosted model for speed and privacy, not a frontier cloud model — it will occasionally misjudge a step. Pulse is built to notice and self-correct when that happens, not to never make mistakes.
 - **Apps with unusual save/session behavior can still confuse it.** Cloud-autosaving apps, or apps that resume a previous session instead of starting blank, are a known hard case — Pulse checks for this, but coverage isn't complete for every app.
 - **Vision fallback is a real capability, not infallible.** It can misread low-contrast or very small on-screen elements, same as any vision model.

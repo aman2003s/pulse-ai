@@ -5,6 +5,7 @@ import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
+from core.paths import models_dir
 from core.voice.wake_listener import WakeListener
 from core.voice.capture import CapturePipeline
 from core.voice.tts import TTSService
@@ -1253,8 +1254,7 @@ class VoiceController:
         if os.path.isabs(name_or_path):
             path = name_or_path
         else:
-            root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-            path = os.path.join(root, 'models', 'assets', name_or_path)
+            path = os.path.join(models_dir(), 'assets', name_or_path)
         data, fs = sf.read(path, dtype='float32')
         # sd.wait()/blocking playback is a confirmed Windows-specific PortAudio
         # bug (python-sounddevice #283) that cuts audio off slightly before the
@@ -1278,8 +1278,7 @@ class VoiceController:
         else, Kokoro is called exactly ONCE per word to synthesize and cache a new asset —
         every training round and every future retrain after that reuses the cached file, so
         Kokoro never runs again for that word."""
-        root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-        assets_dir = os.path.join(root, 'models', 'assets')
+        assets_dir = os.path.join(models_dir(), 'assets')
         word = self.wake_word
         if word == "pulse":
             return os.path.join(assets_dir, f"prompt_{kind}.wav")
@@ -1336,8 +1335,13 @@ class VoiceController:
         import glob, subprocess, sys, gc
         import scipy.io.wavfile as wavf
         word = self.wake_word
+        # root: still the source-tree project root, not models_dir() — this flow shells
+        # out to scripts/train_pulse_v2.py with sys.executable, which requires a real
+        # Python interpreter and the script on disk. Retraining the wake word is a
+        # source-checkout-only feature for now; a packaged/frozen build doesn't have
+        # a general-purpose interpreter to run this script with (see docs/INSTALLER_PLAN.md).
         root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-        outdir = os.path.join(root, 'models', 'user_samples')
+        outdir = os.path.join(models_dir(), 'user_samples')
         os.makedirs(outdir, exist_ok=True)
 
         # Instant UI feedback the moment the button is clicked — before any audio work.
@@ -1428,7 +1432,7 @@ class VoiceController:
         )
 
         for f in ('pulse_v2.onnx', 'pulse_v2.onnx.data'):
-            p = os.path.join(root, 'models', f)
+            p = os.path.join(models_dir(), f)
             if os.path.exists(p):
                 os.remove(p)
         env = dict(os.environ, PYTHONUTF8='1', PYTHONUNBUFFERED='1', PULSE_WAKE_WORD=word)

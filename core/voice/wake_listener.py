@@ -7,6 +7,8 @@ from openwakeword.model import Model
 import os
 import traceback
 
+from core.paths import models_dir
+
 class WakeListener:
     def __init__(self, callback, model_name="pulse", is_speaking_fn=None):
         self.model_name = model_name
@@ -14,7 +16,7 @@ class WakeListener:
         self.is_running = False
         self.stream = None
         self.owwModel = None
-        self.model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'models', f'{model_name}.onnx'))
+        self.model_path = os.path.join(models_dir(), f'{model_name}.onnx')
         # AEC-lite: we have no real echo cancellation, so Pulse's own TTS can bleed into
         # the mic and false-trigger the wake word. Require much higher confidence while
         # speaking — a genuine "Pulse" said over playback still scores near 1.0, but

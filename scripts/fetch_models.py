@@ -5,7 +5,9 @@ import json
 import zipfile
 import sys
 
-MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models')
+from core.paths import models_dir
+
+MODELS_DIR = models_dir()
 # Public source (confirmed working 2026-07-28) — this used to be a hardcoded
 # path on the original developer's own machine, which meant this script
 # silently did nothing for anyone else who cloned the repo. The planner model

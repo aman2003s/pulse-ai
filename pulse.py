@@ -35,13 +35,35 @@ class PulseOrchestrator:
         self.llama_port = 8081
 
     def start_llama(self):
-        MODELS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'models'))
+        from core.paths import models_dir
+        MODELS_DIR = models_dir()
         MODEL_PATH = os.path.join(MODELS_DIR, 'gemma-4-E4B-it-Q4_K_M.gguf')
         SERVER_EXE = os.path.join(MODELS_DIR, 'llama-server.exe')
         MMPROJ_PATH = os.path.join(MODELS_DIR, 'mmproj.gguf')
 
+        # The packaged installer deliberately ships without the multi-gigabyte
+        # engine binary and model weights (see docs/INSTALLER_PLAN.md) to keep
+        # the installer itself small — first run fetches them here, the same
+        # logic `python scripts/fetch_models.py` already runs for a source
+        # checkout. Running from source with models/ already populated (the
+        # existing, unchanged path) skips straight past every one of these,
+        # since each is a no-op when its target file already exists.
+        if not (os.path.exists(SERVER_EXE) and os.path.exists(MODEL_PATH)):
+            logger.info("First run: fetching the local model runtime (this can take a while)...")
+            try:
+                import scripts.fetch_models as fetch_models
+                fetch_models.MODELS_DIR = MODELS_DIR
+                fetch_models.GEMMA_TARGET = MODEL_PATH
+                fetch_models.MMPROJ_TARGET = MMPROJ_PATH
+                os.makedirs(MODELS_DIR, exist_ok=True)
+                fetch_models.setup_gemma()
+                fetch_models.setup_mmproj()
+                fetch_models.fetch_llama_server()
+            except Exception:
+                logger.exception("Automatic model fetch failed.")
+
         if not os.path.exists(SERVER_EXE):
-            logger.error("llama-server not found.")
+            logger.error("llama-server not found (fetch may have failed — check network access and try again).")
             return
 
         # LookAtScreenTool (system_tools.py) needs the server to actually
@@ -56,48 +78,61 @@ class PulseOrchestrator:
             logger.warning("mmproj.gguf not found — running text-only, vision tools will fail.")
 
         import httpx
-        for port in (8081, 8082, 8083):  # M7.2: fall back if port is taken
-            logger.info(f"Starting llama-server on port {port}...")
-            self.llama_process = subprocess.Popen(
-                # --parallel 1: Pulse only ever has one active conversation at a time.
-                # Without this, llama-server defaults to multiple slots, each with its
-                # own separate KV cache — a "warm" cached prompt in one slot does nothing
-                # if the next request gets routed to a different, cold slot. Pinning to
-                # a single slot guarantees the same cache is reused every time (measured:
-                # ~0.8s warm vs ~14s cold for this app's real ~2800-token system prompt).
-                # -c: Gemma 4 E4B supports up to 128K natively. Each individual call's
-                # ACTUAL usage is bounded by design — system prompt (~3-4K tokens) +
-                # small conversation history + screen context + this round's action
-                # summary (already hard-capped at 1500 chars in controller.py) — a
-                # realistic worst case lands in the low thousands, not tens of
-                # thousands. 32768 (25% of the model's max) is a deliberate multiple
-                # of that realistic peak, not the full 128K: llama.cpp PRE-ALLOCATES
-                # the KV cache at this size regardless of actual per-call usage, so
-                # going all the way to 128K would burn memory for headroom nobody
-                # needs, working against "fast" on the project's stated 8GB-RAM
-                # target. Raise further only if you have concrete evidence a task is
-                # actually filling this.
-                [SERVER_EXE, "-m", MODEL_PATH, "--port", str(port), "-c", "32768", "-ngl", "99", "--parallel", "1"] + mm_args,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            deadline = time.time() + 120
-            while time.time() < deadline:
-                if self.llama_process.poll() is not None:
-                    logger.warning(f"llama-server exited during startup on port {port}.")
-                    break
-                try:
-                    if httpx.get(f"http://127.0.0.1:{port}/health", timeout=2).status_code == 200:
-                        logger.info("llama-server ready.")
-                        self.llama_port = port
-                        return
-                except httpx.RequestError:
-                    pass
-                time.sleep(2)
-            else:
-                logger.error("llama-server did not become healthy within 120s.")
-                return
-        logger.error("llama-server failed on all ports.")
+        # Try GPU offload first, then fall back to CPU-only. A machine with no GPU,
+        # an unsupported GPU, or missing/broken drivers can fail to even initialize
+        # the GPU backend rather than gracefully degrading — since this same binary
+        # runs on whatever hardware a given user happens to have (not just this dev
+        # machine), a hardcoded "-ngl 99" would leave Pulse unable to start at all
+        # on those machines. Trying 0 (CPU) after 99 (GPU) fails costs a few seconds
+        # on GPU-less machines and nothing extra when GPU works on the first try.
+        for ngl in ("99", "0"):
+            mode = "GPU" if ngl != "0" else "CPU-only"
+            for port in (8081, 8082, 8083):  # M7.2: fall back if port is taken
+                logger.info(f"Starting llama-server on port {port} ({mode})...")
+                self.llama_process = subprocess.Popen(
+                    # --parallel 1: Pulse only ever has one active conversation at a time.
+                    # Without this, llama-server defaults to multiple slots, each with its
+                    # own separate KV cache — a "warm" cached prompt in one slot does nothing
+                    # if the next request gets routed to a different, cold slot. Pinning to
+                    # a single slot guarantees the same cache is reused every time (measured:
+                    # ~0.8s warm vs ~14s cold for this app's real ~2800-token system prompt).
+                    # -c: Gemma 4 E4B supports up to 128K natively. Each individual call's
+                    # ACTUAL usage is bounded by design — system prompt (~3-4K tokens) +
+                    # small conversation history + screen context + this round's action
+                    # summary (already hard-capped at 1500 chars in controller.py) — a
+                    # realistic worst case lands in the low thousands, not tens of
+                    # thousands. 32768 (25% of the model's max) is a deliberate multiple
+                    # of that realistic peak, not the full 128K: llama.cpp PRE-ALLOCATES
+                    # the KV cache at this size regardless of actual per-call usage, so
+                    # going all the way to 128K would burn memory for headroom nobody
+                    # needs, working against "fast" on the project's stated 8GB-RAM
+                    # target. Raise further only if you have concrete evidence a task is
+                    # actually filling this.
+                    [SERVER_EXE, "-m", MODEL_PATH, "--port", str(port), "-c", "32768", "-ngl", ngl, "--parallel", "1"] + mm_args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                deadline = time.time() + 120
+                became_healthy = False
+                while time.time() < deadline:
+                    if self.llama_process.poll() is not None:
+                        logger.warning(f"llama-server ({mode}) exited during startup on port {port}.")
+                        break
+                    try:
+                        if httpx.get(f"http://127.0.0.1:{port}/health", timeout=2).status_code == 200:
+                            logger.info(f"llama-server ready ({mode}, port {port}).")
+                            self.llama_port = port
+                            became_healthy = True
+                            break
+                    except httpx.RequestError:
+                        pass
+                    time.sleep(2)
+                if became_healthy:
+                    return
+                logger.error(f"llama-server ({mode}) did not become healthy on port {port}; trying next.")
+                if self.llama_process.poll() is None:
+                    self.llama_process.terminate()
+        logger.error("llama-server failed on all ports, both GPU and CPU-only.")
         
     def check_and_restart_llama(self):
         if self.llama_process and self.llama_process.poll() is not None:

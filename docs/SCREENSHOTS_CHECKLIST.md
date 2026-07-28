@@ -2,7 +2,7 @@
 
 Exactly what's needed to fill in the [README's Screenshots section](../README.md#screenshots) and give the docs real visuals instead of descriptions. If you'd like to help and don't want to write code, this is a great way to contribute.
 
-## Ground rules for every capture (matches the [demo video](DEMO_VIDEO_STORYBOARD.md) standard — this is a public, professional release)
+## Ground rules for every capture (matches the [demo video](../docs/assets/pulse_launch_demo.mp4) standard — this is a public, professional release)
 
 - **Clean desktop.** No personal files, no unrelated desktop icons, no browser tabs with personal accounts logged in, no unrelated notification toasts.
 - **A neutral, uncluttered background app** where Pulse is shown acting on something (Notepad with placeholder text is a safe default; avoid anything with real personal content).
@@ -21,7 +21,7 @@ Exactly what's needed to fill in the [README's Screenshots section](../README.md
 | 5 | **Speaking / feedback state** | Overlay narrating a completed step | README |
 | 6 | **Settings popup** | The settings panel open (feedback mode, mic device, etc.) | INSTALLATION.md or a future SETTINGS.md |
 | 7 | **Superhero Mode example** | Overlay narrating continuously, mid-task | README's Superhero Mode section |
-| 8 | **Full task GIF** | Animated: say "Pulse, open Notepad and write 'how are you all?'" through completion — the same command used in the [demo video](DEMO_VIDEO_STORYBOARD.md) | README hero |
+| 8 | **Full task GIF** | Animated: say "Pulse, open Notepad and write 'hello, how are you'" through completion — the same command used in the [demo video](../docs/assets/pulse_launch_demo.mp4) | README hero |
 | 9 | **Disconnected/error state** | What the overlay shows if the backend isn't reachable | TROUBLESHOOTING.md |
 | 10 | **A multi-step task in progress** | Something like the Word open→type→save flow, mid-step | ARCHITECTURE.md's command processing flow section |
 

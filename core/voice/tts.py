@@ -9,6 +9,8 @@ import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 
+from core.paths import models_dir
+
 warnings.filterwarnings("ignore")
 
 def pad_silence(pcm: np.ndarray, samplerate: int, pad_s: float = 0.25) -> np.ndarray:
@@ -47,7 +49,7 @@ class TTSService:
         self.cancel_event = threading.Event()
         self.is_playing = False
         self.last_active = 0.0  # for AEC-lite: audio can still be resonating briefly after playback ends
-        self.assets_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'models', 'assets'))
+        self.assets_dir = os.path.join(models_dir(), 'assets')
 
     # Researched (2026-07-27): sd.wait()/blocking=True is a KNOWN Windows bug —
     # python-sounddevice issue #283 confirms it cuts playback off slightly
