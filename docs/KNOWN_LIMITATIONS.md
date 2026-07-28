@@ -27,4 +27,4 @@ A short version of this lives in the [README](../README.md#known-limitations). T
 
 ## Reporting something not listed here
 
-[Open an issue](../../../issues/new/choose) with the bug report template — the more concrete (exact phrasing used, exact app, log excerpt from `%APPDATA%\Pulse\pulse.log`), the faster it can be root-caused.
+[Open an issue](https://github.com/aman2003s/pulse-ai/issues/new/choose) with the bug report template — the more concrete (exact phrasing used, exact app, log excerpt from `%APPDATA%\Pulse\pulse.log`), the faster it can be root-caused.

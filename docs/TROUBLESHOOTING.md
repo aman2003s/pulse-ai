@@ -9,7 +9,7 @@
 ### `python scripts/fetch_models.py` fails or hangs
 
 - It downloads several gigabytes — a slow or interrupted connection is the most common cause. Re-running the script is safe; it skips files that already downloaded successfully.
-- If a specific download consistently fails, check that the URL in `scripts/fetch_models.py` still resolves (Hugging Face occasionally reorganizes model repos) and [open an issue](../../../issues/new/choose) if so.
+- If a specific download consistently fails, check that the URL in `scripts/fetch_models.py` still resolves (Hugging Face occasionally reorganizes model repos) and [open an issue](https://github.com/aman2003s/pulse-ai/issues/new/choose) if so.
 
 ### `llama-server not found` / Pulse won't start
 
@@ -51,4 +51,4 @@ Please report this — see [Known Limitations → Application compatibility](KNO
 
 ## Still stuck?
 
-[Open an issue](../../../issues/new/choose) with the bug report template — include your Windows version, the exact command you gave Pulse, and the relevant `pulse.log` excerpt.
+[Open an issue](https://github.com/aman2003s/pulse-ai/issues/new/choose) with the bug report template — include your Windows version, the exact command you gave Pulse, and the relevant `pulse.log` excerpt.
