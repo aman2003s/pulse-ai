@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/aman2003s/pulse-ai/security/advisories/new
+    about: Please report security issues privately rather than as a public issue — see SECURITY.md.
+  - name: Question or discussion
+    url: https://github.com/aman2003s/pulse-ai/discussions
+    about: For general questions or ideas that aren't yet a concrete bug or feature request.

@@ -1,0 +1,49 @@
+name: Feature request
+description: Suggest an idea or capability for Pulse
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please check the [Roadmap](../../README.md#roadmap) — it may already be planned. Pulse's philosophy is "small, well-tested features" over breadth, so the strongest requests are specific and grounded in a real task you were trying to do.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do that Pulse can't do today?
+      description: Describe the actual task, not just the feature — this helps us understand the real need.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like Pulse to do instead?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: What area does this touch?
+      options:
+        - Voice interaction / wake word
+        - Task planning / execution
+        - A specific app or automation gap
+        - Accessibility
+        - Installation / setup
+        - UI / overlay
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Anything you've already tried as a workaround?
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Anything else?
