@@ -1,51 +1,44 @@
 # Windows Installer — Status & Plan
 
-Honest status, not a "done" claim — see [Constraints](#whats-not-done-yet) below before assuming the installer is ready to ship.
+Honest status, not a "done" claim — see [What's still rough](#whats-still-rough) below before assuming this is a polished, finished experience.
 
-## What's done
+## What's done and verified
 
-`ui/src-tauri/tauri.conf.json`'s bundler is now enabled and configured:
+The installer is real: it packages the full app — Tauri UI **and** the Python backend (voice, planning, task execution) — not just the UI shell. This was built, installed on a clean profile, and launched end-to-end with no manual setup: double-click the shortcut, the backend spawns itself, and on first run it fetches its own model weights automatically.
 
-- `bundle.active: true`, target `nsis` (Windows-only, matching Pulse itself)
-- `installMode: "currentUser"` — installs to the user's own profile, **no administrator privileges required**, matching "let people install it and try it" over a heavier enterprise-style install
-- Publisher/copyright/description metadata set, so the installer and "Apps & Features" entry look intentional, not blank
-- Uses the icon already present at `ui/src-tauri/icons/icon.ico`
+**How it fits together:**
 
-Tauri's **default NSIS template already provides**, with no further config needed: a standard installation wizard, a Desktop shortcut, a Start Menu shortcut, a "launch after installation" option, and proper uninstall support (registered in Windows' Add/Remove Programs). This matches the installer requirements in the release plan for the *UI shell itself*.
+- `ui/src-tauri/src/main.rs` — on launch, checks whether a Pulse core is already running (the same port-based lock `pulse.py`'s `ensure_single_instance()` uses). If not, it spawns the bundled `pulse-core.exe` with `PULSE_MODELS_DIR` pointed at the installed resource location, then shows the window as normal. Running from source is unaffected — this only activates in the packaged build.
+- `pulse-core.spec` (project root) — the PyInstaller spec that freezes the Python backend (`pulse.py` and everything it imports) into a standalone `pulse-core.exe`, ~1.1GB unpacked. Rebuild it with:
+  ```bash
+  venv\Scripts\pyinstaller pulse-core.spec
+  ```
+- `core/paths.py` — a single `models_dir()` helper, now used everywhere the codebase locates `models/` (`pulse.py`, `capture.py`, `tts.py`, `wake_listener.py`, `controller.py`, `fetch_models.py`). Honors `PULSE_MODELS_DIR` when set; falls back to the original relative-to-source path when it isn't. This exists because a PyInstaller onedir build nests package files under an internal subfolder, so `__file__`-relative math doesn't reliably land next to a sibling `models/` folder the way it does running from source.
+- `ui/src-tauri/tauri.conf.json`'s `bundle.resources` bundles the frozen `pulse-core/` folder plus the small, non-redownloadable assets (`pulse.onnx`/`pulse_v2.onnx` wake-word models, `assets/*.wav`, a couple of standalone prompt `.wav` files) — **not** `models/*.gguf`, not the llama.cpp engine binaries, not the Whisper cache. Those are multi-gigabyte and downloadable, so bundling them would make the installer itself huge for no benefit.
+- `pulse.py`'s `start_llama()` now calls the same fetch logic `python scripts/fetch_models.py` already ran manually — if `llama-server.exe` or the Gemma weights aren't found next to a fresh install, it fetches them (Gemma GGUF ~5GB, mmproj ~950MB, the llama.cpp engine + DLLs) before starting the server. Running from source with `models/` already populated skips straight past this, unchanged.
+- **GPU/CPU robustness**: `start_llama()` used to hardcode `-ngl 99` (force GPU offload) with no fallback — a machine with no GPU, an unsupported one, or broken drivers could fail to start at all. It now tries GPU first, then retries CPU-only on every port if that fails, so the same installer works on GPU and GPU-less machines instead of assuming the dev machine's hardware.
+- The installer itself: **~320MB** (NSIS/LZMA-compressed from the ~1.1GB unpacked core), matching the goal of keeping the download small while deferring the actual model weights to first run.
 
-## How to build and test it
-
-Not yet run in this pass — do this before treating it as verified:
-
+**Build + test loop that produced this** (useful if you're touching packaging again):
 ```bash
-cargo install tauri-cli --version "^2"   # one-time; not yet installed in this environment
-cd ui
-cargo tauri build
+venv\Scripts\pyinstaller pulse-core.spec        # rebuild the frozen backend
+cd ui/src-tauri && cargo tauri build            # produces target/release/bundle/nsis/Pulse_<ver>_x64-setup.exe
 ```
+Then actually install it (`Pulse_<ver>_x64-setup.exe /S` for silent) and launch `pulse-ui.exe` from the install directory — don't trust "the build succeeded" alone. Three real bugs only surfaced this way: missing phonemizer/`language_tags` data files, a missing `core/schema.sql`, and misaki's spaCy dependency (`en_core_web_sm`) not being bundled — each one built cleanly and only crashed at actual runtime.
 
-This produces an NSIS installer under `ui/src-tauri/target/release/bundle/nsis/`. Install it on a clean-ish machine (or at least a fresh user profile) and confirm: desktop/Start Menu shortcuts appear, the app launches, and uninstall via Windows Settings actually removes it cleanly.
+## What's still rough
 
-## What's NOT done yet
+- **First run is slow and silent.** Fetching ~6GB of models has no progress UI yet — right now it's a log line (`pulse.log`) and a blank/disconnected overlay until it finishes. A real first-run experience needs a visible download-progress state, not just "wait an unspecified number of minutes."
+- **Wake-word retraining is source-only.** The "train a custom wake word" flow shells out to `scripts/train_pulse_v2.py` via `sys.executable` — in a frozen build, `sys.executable` is `pulse-core.exe` itself, not a general Python interpreter, so this specific flow doesn't work from the packaged app yet. Everything else (voice interaction, planning, task execution) does.
+- **Not yet auto-updating.** No update-check mechanism; a new version means re-downloading and re-running the installer.
+- **Auto-startup not implemented.** Still needs [`tauri-plugin-autostart`](https://v2.tauri.app/plugin/autostart/) wired into `main.rs` plus a settings toggle — straightforward now that the Rust side owns the real startup sequence, just not done yet.
+- **Only tested on one machine so far.** Verified end-to-end on the dev machine (GPU present); the CPU fallback path is implemented and reasoned through but hasn't been confirmed on genuinely GPU-less hardware.
 
-This is the important part. **The installer as configured only packages the Tauri UI overlay** (`ui/src-tauri` → `pulse-ui.exe`). It does **not** package or launch:
+## Publishing a release
 
-- The Python core (`pulse.py`) and its dependencies
-- `llama-server.exe` and the local models
+This environment has no `gh` CLI or GitHub credentials configured, so cutting the actual GitHub Release has to happen from a machine that does:
 
-Today, `run.bat` is what starts the Python backend, waits for it to be healthy, *then* launches the UI — someone who installs only the NSIS-built UI installer and double-clicks the Start Menu shortcut would get a UI with nothing to connect to.
-
-### Recommended next step (separate, focused PR)
-
-1. **Freeze the Python backend** into a standalone `.exe` with [PyInstaller](https://pyinstaller.org/) — the real risk here is the heavier native dependencies (`sounddevice`, `onnxruntime`, `faster-whisper`, CUDA DLLs already in `models/`) packaging correctly; this needs its own testing pass, not a rushed one.
-2. **Add it as a [Tauri sidecar](https://v2.tauri.app/develop/sidecar/)** — Tauri's mechanism for bundling and managing an external binary's lifecycle alongside the main app.
-3. **Move `run.bat`'s startup sequence into Rust** (`ui/src-tauri/src/main.rs` currently does nothing but launch the window — see [`docs/ARCHITECTURE.md#startup-flow`](ARCHITECTURE.md#startup-flow) for the sequence it needs to replicate: spawn the backend sidecar, poll `/health`, then show the window).
-4. **Keep the multi-gigabyte model files OUT of the installer itself** — bundling ~7GB of models into an NSIS installer would make it enormous and slow to download/update. Better: have first-run trigger the same download `scripts/fetch_models.py` already does (with a progress UI), so the installer itself stays small and updates don't re-download unchanged models.
-5. Only then should [auto-startup](#auto-startup-not-yet-implemented) be wired up (below) — it depends on the Rust side already owning the full startup sequence.
-
-## Auto-startup — not yet implemented
-
-The release plan asks for optional "start Pulse when Windows starts," toggleable from settings. This needs [`tauri-plugin-autostart`](https://v2.tauri.app/plugin/autostart/) added to `ui/src-tauri/Cargo.toml` and registered in `main.rs`, plus a settings-UI toggle wired to it. Not done in this pass — it depends on the Rust side owning the full startup sequence (item 3 above) to be genuinely useful; toggling autostart for a UI-only exe that then has nothing to talk to isn't a real feature.
-
-## Why this was scoped this way
-
-This release's stated priority is letting people install, try, and report bugs — and per the release plan's own framing, harder fixes are meant to land "one by one... with proper release notes," not all at once. Shipping a config that's real and verifiable now, with an honest, concrete plan for the harder remaining piece, is more useful than claiming a fully-bundled one-click installer exists when it hasn't actually been built or tested.
+1. Build it: `cd ui/src-tauri && cargo tauri build`
+2. The installer lands at `ui/src-tauri/target/release/bundle/nsis/Pulse_<version>_x64-setup.exe`
+3. Create a GitHub Release (tag it, e.g., `v0.1.0`) and upload that `.exe` as a release asset
+4. Update the README's Installation section to link the release asset directly

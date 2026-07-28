@@ -7,7 +7,7 @@ Assumes you've already followed [`docs/INSTALLATION.md`](INSTALLATION.md) and Pu
 1. Say **"Pulse"** and wait — you'll hear or see a short acknowledgment (e.g. "I'm listening").
 2. Say what you want, in plain language:
 
-   > "Pulse, open Notepad and write 'how are you all?'"
+   > "Pulse, open Notepad and write 'hello, how are you'"
 
 3. Watch (or listen to) the overlay narrate each step: opening the app, reading the screen, typing the text.
 4. Pulse tells you when it's done, or asks a question if it's missing something it needs.

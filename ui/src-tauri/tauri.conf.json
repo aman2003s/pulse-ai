@@ -35,6 +35,16 @@
     "copyright": "© 2026 Pulse Project",
     "shortDescription": "Offline-first, voice-first AI computer companion.",
     "longDescription": "Pulse lets you control your computer through natural conversation — local, voice-first, and built accessibility-first. See https://github.com/aman2003s/pulse-ai",
+    "resources": {
+      "../../dist/pulse-core": "pulse-core",
+      "../../models/pulse.onnx": "models/pulse.onnx",
+      "../../models/pulse.onnx.data": "models/pulse.onnx.data",
+      "../../models/pulse_v2.onnx": "models/pulse_v2.onnx",
+      "../../models/pulse_v2.onnx.data": "models/pulse_v2.onnx.data",
+      "../../models/ack.wav": "models/ack.wav",
+      "../../models/superhero_on.wav": "models/superhero_on.wav",
+      "../../models/assets": "models/assets"
+    },
     "windows": {
       "nsis": {
         "installMode": "currentUser",
