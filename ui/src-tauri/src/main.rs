@@ -31,8 +31,13 @@ fn spawn_backend(resource_dir: PathBuf) {
     // core/paths.py's models_dir() at the resource-bundled location explicitly.
     // Running from source never sets this, so that behavior is unaffected.
     cmd.env("PULSE_MODELS_DIR", &models_dir);
-    cmd.env("HF_HUB_OFFLINE", "1");
-    cmd.env("TRANSFORMERS_OFFLINE", "1");
+    // Deliberately NOT setting HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE here (unlike
+    // run.bat, which sets both for the dev flow where every model is already
+    // cached). fetch_models.py's own downloads are plain urllib and ignore that
+    // flag either way, but Kokoro/faster-whisper/openwakeword's OWN first-use
+    // model fetches go through huggingface_hub and DO respect it — forcing
+    // offline here would silently break their first-time download on a genuinely
+    // fresh machine that doesn't already have those specific caches populated.
 
     match cmd.spawn() {
         Ok(_) => println!("[Pulse] Backend starting (models: {:?}).", models_dir),
