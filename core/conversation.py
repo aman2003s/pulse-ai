@@ -28,19 +28,24 @@ class ConversationManager:
         now = time.time()
         if now - self.last_interaction_time > self.idle_timeout_s:
             self.history = []
-            
+
         if not self.history:
             return ""
-            
-        context = "Recent Conversation History:\n"
+
+        # Deliberately NOT including what Pulse previously SAID (only the user's
+        # request and the real tool outcomes) — confirmed real bug: the old
+        # "Pulse (spoken)" line was the ONLY thing ever actually injected here
+        # (the "Pulse Actions" zip below it was silently dead code, since the
+        # call site always passes plan=[]), so on a structurally similar later
+        # command the model had nothing to ground itself in except recycled
+        # prior narration, and would repeat/blend old phrasing instead of
+        # describing what it actually just did this round.
+        context = ("Recent Conversation History (for resolving references like "
+                   "'it' / 'that file' / 'the second one' ONLY — never copy or "
+                   "reuse phrasing from here; describe THIS round's real results):\n")
         for ex in self.history:
-            context += f"User: {ex['user']}\n"
-            if ex['assistant'].get('speak'):
-                context += f"Pulse (spoken): {ex['assistant']['speak']}\n"
-            plan = ex['assistant'].get('plan', [])
-            if plan:
-                context += "Pulse Actions:\n"
-                for step, res in zip(plan, ex['results']):
-                    context += f"- {step['tool']}({step['params']}) -> {res}\n"
+            context += f"User asked: {ex['user']}\n"
+            if ex.get('results'):
+                context += f"Actual outcomes: {ex['results']}\n"
             context += "\n"
         return context

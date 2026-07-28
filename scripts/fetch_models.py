@@ -6,20 +6,51 @@ import zipfile
 import sys
 
 MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models')
-GEMMA_SOURCE = r"C:\Users\itzam\Desktop\animatron\models\gemma-4-E4B-it-Q4_K_M.gguf"
+# Public source (confirmed working 2026-07-28) — this used to be a hardcoded
+# path on the original developer's own machine, which meant this script
+# silently did nothing for anyone else who cloned the repo. The planner model
+# is the one thing every install genuinely needs, so this can't be a manual
+# step left implicit.
+GEMMA_URL = "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf"
 GEMMA_TARGET = os.path.join(MODELS_DIR, "gemma-4-E4B-it-Q4_K_M.gguf")
+# Vision projector for look_at_screen/click_at_position (screen understanding) —
+# optional: llama-server runs text-only fine without it, but those two tools
+# will fail without --mmproj pointed at this file.
+MMPROJ_URL = "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/mmproj-F16.gguf"
+MMPROJ_TARGET = os.path.join(MODELS_DIR, "mmproj.gguf")
+
+def _download_with_progress(url, target_path, label):
+    print(f"Downloading {label} from {url}...")
+    def _report(block_num, block_size, total_size):
+        if total_size <= 0:
+            return
+        done = block_num * block_size
+        pct = min(100, done * 100 // total_size)
+        print(f"\r  {label}: {pct}% ({done // (1024*1024)}MB / {total_size // (1024*1024)}MB)", end="", flush=True)
+    tmp_path = target_path + ".partial"
+    try:
+        urllib.request.urlretrieve(url, tmp_path, reporthook=_report)
+        print()
+        os.replace(tmp_path, target_path)
+        print(f"{label} downloaded successfully.")
+    except Exception as e:
+        print(f"\n{label} download failed: {e}")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 def setup_gemma():
     if os.path.exists(GEMMA_TARGET):
         print(f"Gemma already exists at {GEMMA_TARGET}")
         return
-    if os.path.exists(GEMMA_SOURCE):
-        print(f"Copying Gemma from {GEMMA_SOURCE} to {GEMMA_TARGET}...")
-        os.makedirs(MODELS_DIR, exist_ok=True)
-        shutil.copy2(GEMMA_SOURCE, GEMMA_TARGET)
-        print("Copied successfully.")
-    else:
-        print(f"Warning: Gemma source not found at {GEMMA_SOURCE}")
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    _download_with_progress(GEMMA_URL, GEMMA_TARGET, "Gemma 4 E4B (~5GB)")
+
+def setup_mmproj():
+    if os.path.exists(MMPROJ_TARGET):
+        print(f"mmproj already exists at {MMPROJ_TARGET}")
+        return
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    _download_with_progress(MMPROJ_URL, MMPROJ_TARGET, "vision projector (~950MB)")
 
 def fetch_llama_server():
     server_path = os.path.join(MODELS_DIR, "llama-server.exe")
@@ -89,6 +120,7 @@ def fetch_other_models():
 if __name__ == "__main__":
     os.makedirs(MODELS_DIR, exist_ok=True)
     setup_gemma()
+    setup_mmproj()
     fetch_llama_server()
     fetch_other_models()
     print("Model fetch process completed.")

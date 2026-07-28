@@ -22,7 +22,6 @@ import os
 import shutil
 import numpy as np
 import scipy.io.wavfile as wf
-import scipy.signal
 import soundfile as sf
 
 # ── paths ─────────────────────────────────────────────────────────────────────
@@ -52,6 +51,8 @@ def gap(duration_s):
     return np.zeros(int(SR * duration_s), dtype=np.float32)
 
 
+
+
 def save_pcm(name, audio_f32):
     path = os.path.join(ASSETS, name)
     pcm = (np.clip(audio_f32, -1, 1) * 32767).astype(np.int16)
@@ -74,21 +75,36 @@ save_pcm("beep_bad.wav", np.concatenate([
     fade(sine(440, 0.15)),
 ]))
 
-def chime_note(freq, duration_s, attack_ms=12, amplitude=0.5):
-    t = np.linspace(0, duration_s, int(SR * duration_s), endpoint=False)
-    # Warm bell sound: Fundamental + soft 2nd & 3rd harmonic
-    signal = np.sin(2 * np.pi * freq * t) + 0.25 * np.sin(2 * np.pi * (freq * 2) * t) + 0.1 * np.sin(2 * np.pi * (freq * 3) * t)
-    # Exponential bell decay envelope
-    env = np.exp(-t * 9.0)
+def pad_note(freq, duration_s, amplitude=0.6, attack_ms=30, release_ms=110):
+    """A warm, held 'synth pad' note — soft swell-in, brief sustain, smooth cosine
+    release to true zero. Siri's actual chime is described (per published sound-
+    design analysis) as 'a soft two-note rising melody, somewhere between a doorbell
+    and a synth pad', using lower-mid/upper-midbass frequencies, not bright high
+    ones — the earlier attempts were pitched too high and too percussive."""
+    n = int(SR * duration_s)
+    t = np.linspace(0, duration_s, n, endpoint=False)
+    # Fundamental + gentle upper warmth + a touch of sub-octave for body — kept
+    # soft/rounded, not bright (no 3rd harmonic, low weights throughout).
+    signal = (np.sin(2 * np.pi * freq * t)
+              + 0.12 * np.sin(2 * np.pi * freq * 2 * t)
+              + 0.05 * np.sin(2 * np.pi * freq * 0.5 * t))
+    env = np.ones(n)
     n_att = int(SR * attack_ms / 1000)
-    env[:n_att] *= np.linspace(0, 1, n_att)
+    env[:n_att] = np.linspace(0, 1, n_att) ** 1.3  # gentle swell-in, not a pluck
+    n_rel = int(SR * release_ms / 1000)
+    env[-n_rel:] *= 0.5 * (1 + np.cos(np.linspace(0, np.pi, n_rel)))  # smooth to true 0
     return (signal * env * amplitude).astype(np.float32)
 
-# Sweet, modern two-tone assistant wake chime (C5 -> G5, 523Hz -> 784Hz) with warm bell harmonics
+# Soft two-note rising chime, doorbell/pad character: G4 -> C5 (lower-mid register),
+# each note held and released gently rather than struck and cut short. A small
+# clean silent gap between them, NOT an overlap — overlapping two different pitches
+# sums into audible beating/interference (two sine waves at different frequencies
+# added together produce a warbling amplitude artifact), which is exactly the
+# "stretched/breaking" sound just reported. A brief real gap has no such artifact.
 save_pcm("ack.wav", np.concatenate([
-    chime_note(523.25, 0.13, amplitude=0.55),
-    gap(0.015),
-    chime_note(783.99, 0.18, amplitude=0.50),
+    pad_note(392.00, 0.20, amplitude=0.62, attack_ms=30, release_ms=90),
+    gap(0.03),
+    pad_note(523.25, 0.24, amplitude=0.58, attack_ms=25, release_ms=120),
 ]))
 
 
@@ -102,15 +118,20 @@ SPEED = 1.0
 
 
 def kokoro_to_wav(text, filename):
-    """Synthesise `text` with Kokoro, resample to 16 kHz, save as asset."""
-    # Kokoro outputs at 24 kHz
+    """Synthesise `text` with Kokoro and save at its NATIVE 24kHz — no downsample.
+    These assets (especially the prefix_*.wav ones) get spliced directly against
+    live Kokoro synthesis in speak_hybrid(); resampling them to 16kHz cuts
+    everything above 8kHz and made the pre-baked prefix sound audibly duller/
+    muffled than the dynamic part spoken right after it in the same sentence —
+    a real, confirmed tone mismatch, not just perception. Playback already reads
+    the rate from the file itself (sf.read + sd.play(data, fs)), so writing 24kHz
+    here needs no other code changes."""
     chunks = [audio for _, _, audio in pipeline(text, voice=VOICE, speed=SPEED)]
     audio_24k = np.concatenate(chunks).astype(np.float32)
-
-    # Resample 24000 -> 16000 (ratio 2/3)
-    audio_16k = scipy.signal.resample_poly(audio_24k, up=2, down=3).astype(np.float32)
-
-    save_pcm(filename, audio_16k)
+    path = os.path.join(ASSETS, filename)
+    pcm = (np.clip(audio_24k, -1, 1) * 32767).astype(np.int16)
+    wf.write(path, 24000, pcm)
+    print(f"  wrote  {path}  ({len(audio_24k) / 24000 * 1000:.0f} ms @ 24kHz)")
 
 
 print("Synthesising spoken prompts with Kokoro...")

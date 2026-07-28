@@ -13,11 +13,12 @@ from core.planner.client import PlannerClient
 from core.executor.executor import ToolExecutor
 from core.tools.registry import registry
 import core.tools.win_tools  # noqa: F401 — registers tools
-import core.tools.system_tools  # noqa: F401 — registers tools
+import core.tools.system_tools as system_tools  # registers tools; also used for set_planner_port below
 from core.task_manager import TaskManager
 from core.conversation import ConversationManager
 from core.db import get_db
 from core.voice.typing_echo import TypingEcho
+from core.adapters.win.focus import ensure_target_focused
 import asyncio
 
 class VoiceController:
@@ -26,6 +27,14 @@ class VoiceController:
         self.capture = CapturePipeline()
         self.stt = STTService()
         self.planner = PlannerClient(port=planner_port)
+        # LookAtScreenTool needs a PlannerClient of its own (vision calls go
+        # through a different endpoint than the main text-only prompt() path
+        # — see PlannerClient.analyze_image) but tools are constructed by the
+        # registry, not VoiceController, so there's no direct handle to pass
+        # one through. Same module-level-state pattern already used for
+        # _LAST_ELEMENTS (system_tools.py) rather than threading a new
+        # parameter through ToolExecutor.execute for one tool.
+        system_tools.set_planner_port(planner_port)
         self.executor = ToolExecutor()
         self.tasks = TaskManager()
         self.conversation = ConversationManager()
@@ -52,6 +61,7 @@ class VoiceController:
         # the time a command arrives, so context injection below becomes a cache read.
         self._screen_cache = {}
         self._screen_cache_lock = threading.Lock()
+        self._screen_cache_generation = 0
 
         # We need a reference to the running event loop for broadcasting
         self.loop = asyncio.get_event_loop()
@@ -93,11 +103,24 @@ class VoiceController:
                 # over Pulse's own voice) and "idle" starts fresh.
                 return
             print("\n[WAKE WORD DETECTED]")
-            if self.state == "speaking":
-                print("Interrupting TTS (Barge-in)...")
-                self.tts.cancel()
+            was_speaking = self.state == "speaking"
+            # Set state to "listening" in THIS SAME critical section as the check
+            # above — confirmed real race otherwise: the lock used to release here
+            # with state still "idle" until a later, separate broadcast_state() call
+            # actually flipped it. A second trigger in that window (voice wake-word
+            # firing the same moment the UI button is clicked, e.g.) would see "idle"
+            # too and slip past the guard, starting a second overlapping capture
+            # session — two concurrent PortAudio streams on the same mic, a known
+            # crash risk on Windows.
+            self.state = "listening"
 
-        self.broadcast_state("listening")
+        if was_speaking:
+            print("Interrupting TTS (Barge-in)...")
+            self.tts.cancel()
+        asyncio.run_coroutine_threadsafe(
+            self.ws_server.broadcast({"v": 1, "type": "state", "payload": "listening"}),
+            self.loop
+        )
         self._safe_thread(self.handle_capture_session)
 
     def _vocab_hint(self) -> str:
@@ -112,9 +135,19 @@ class VoiceController:
             return ""
 
     def handle_capture_session(self):
-        # Capture from mic until silence
-        wav_bytes = self.capture.capture_until_silence()
-        
+        # Stop the wake-word listener's own always-on InputStream before opening
+        # capture's — two concurrent PortAudio streams on the same device is a
+        # known crash risk on Windows (already worked around for wake-word
+        # training; this closes the same gap for every normal command, which runs
+        # this exact path on every single utterance, not just an occasional
+        # training session). start()/stop() are cheap here — the ONNX model is
+        # already loaded, only the audio stream itself gets torn down and rebuilt.
+        self.listener.stop()
+        try:
+            wav_bytes = self.capture.capture_until_silence()
+        finally:
+            self.listener.start()
+
         if not wav_bytes:
             print("Nothing captured.")
             self.broadcast_state("idle")
@@ -157,7 +190,11 @@ class VoiceController:
             self.broadcast_state("speaking")
             self.tts.speak(question)
             self.broadcast_state("listening")
-            wav = self.capture.capture_until_silence()
+            self.listener.stop()
+            try:
+                wav = self.capture.capture_until_silence()
+            finally:
+                self.listener.start()
             answer = (self.stt.transcribe(wav) or "").lower() if wav else ""
             if re.search(r"\b(yes|yeah|yep|sure|do it|go ahead|confirm|ok|okay)\b", answer):
                 return True
@@ -165,6 +202,81 @@ class VoiceController:
                 return False
             question = "Sorry, I didn't catch that. Please say yes or no."
         return False
+
+    def ask_slot(self, question: str, default: str = None, timeout_s: float = 6.0) -> str:
+        """Ask for ONE missing piece of information (not yes/no — see ask_confirmation
+        for that). Single ask, bounded listen window, never loops/re-asks. No reply
+        within timeout, or nothing understood, returns `default` unchanged — callers
+        decide what that means (announce-and-proceed if default is a real value,
+        park the task if default is None). This is what makes "automate everything
+        possible" actually hold: a slot question can never hang forever."""
+        self.broadcast_state("speaking")
+        self.tts.speak(question)
+        self.broadcast_state("listening")
+        self.listener.stop()
+        try:
+            wav = self.capture.capture_until_silence(no_speech_timeout_s=timeout_s)
+        finally:
+            self.listener.start()
+        if not wav:
+            return default
+        answer = (self.stt.transcribe(wav, extra_vocab=self._vocab_hint()) or "").strip()
+        return answer if answer else default
+
+    _STATIC_FOLDERS = ("desktop", "documents", "downloads", "pictures", "music", "videos")
+
+    def _normalize_command(self, text: str) -> str:
+        """Deterministic preprocessor for the static lane only — no AI, no model call.
+        Strips politeness/filler so natural phrasings ('could you open my downloads
+        folder please') still hit the static table, without touching the AI lane's
+        own understanding of genuinely ambiguous or rephrased sentences."""
+        import re as _re
+        t = _re.sub(r"\b(please|could you|can you|would you|for me|kindly|just|quickly|now)\b", "", text)
+        return _re.sub(r"\s+", " ", t).strip()
+
+    def _lookup_indexed_app(self, target: str):
+        """Exact/alias match against the real installed-app index — deliberately NOT
+        fuzzy (that precision-over-recall rule is what keeps the static lane safe: a
+        wrong static match executes instantly, a missed one just costs one AI-lane
+        round trip). A hit here means the app is proven to be genuinely installed —
+        no AI needed to decide whether to try opening it."""
+        import json as _json
+        try:
+            conn = get_db()
+            row = conn.execute("SELECT name FROM app_index WHERE name = ?", (target,)).fetchone()
+            if row:
+                return row["name"]
+            for r in conn.execute("SELECT name, aliases FROM app_index"):
+                if target in _json.loads(r["aliases"]):
+                    return r["name"]
+        except Exception:
+            pass
+        return None
+
+    def _static_route(self, norm_text: str):
+        """The static lane's entire routing table. Exact verb + known-entity match
+        only — returns None (never a guess) for anything else, which falls through to
+        the AI planner in process_text. Adding a new simple command later means adding
+        a row here, not a new code path."""
+        import re as _re
+
+        m = _re.match(r"^(?:open|show|launch|start|run|pull up|bring up|fire up)\s+(?:up\s+)?(?:my\s+|the\s+)?(.+?)(?:\s+folder)?$", norm_text)
+        if m:
+            target = m.group(1).strip()
+            if target in self._STATIC_FOLDERS:
+                return ("open_folder", target)
+            app_name = self._lookup_indexed_app(target)
+            if app_name:
+                return ("open_app", app_name)
+            # Any other "<x> folder" phrasing: don't guess-execute against an
+            # unindexed name — the AI lane's screen-context + search_file + ask
+            # flow is what's actually suited to resolving it.
+
+        m = _re.match(r"^(?:close|quit)\s+(?:my\s+|the\s+)?(.+)$", norm_text)
+        if m:
+            return ("close_app", m.group(1).strip())
+
+        return None
 
     def process_text(self, text: str):
         # Direct intents that bypass the planner (reliability > flexibility for these)
@@ -204,6 +316,32 @@ class VoiceController:
             self._speak_broadcast(self.last_spoken or "I haven't said anything yet.")
             self.broadcast_state("idle")
             return
+        if _re.search(r"^(continue|resume|keep going|where were we)\b", low):
+            parked = self.tasks.get_parked_task()
+            if not parked:
+                self._speak_broadcast("There's nothing waiting — what would you like me to do?")
+                self.broadcast_state("idle")
+                return
+            if parked["pending_slot"] == "continuation":
+                # Ran out of round budget, not waiting on an answer — just pick the
+                # original goal back up, no question to re-ask.
+                self.tasks.unpark_task(parked["id"])
+                self._speak_broadcast(f"Picking that back up — {parked['goal']}.")
+                self.process_text(parked["goal"])
+                return
+            # One-line context restatement, then re-ask exactly what was pending —
+            # no re-deriving the question, it's stored verbatim from when it parked.
+            answer = self.ask_slot(f"Continuing — {parked['goal']}. {parked['pending_question']}")
+            if answer:
+                self.tasks.unpark_task(parked["id"])
+                self.process_text(f"{parked['goal']} — {parked['pending_slot']}: {answer}")
+            else:
+                # Still nothing — re-park the SAME task rather than losing it or
+                # looping the question again right now.
+                self.tasks.park_task(parked["id"], parked["pending_slot"], parked["pending_question"])
+                self._speak_broadcast("Still no answer — I'll keep holding onto that. Say \"continue\" whenever you're ready.")
+                self.broadcast_state("idle")
+            return
         m = _re.search(r"^spell(?: the word)? (.+)", low)
         if m:
             word = _re.sub(r"[^a-z0-9]", "", m.group(1))
@@ -239,31 +377,74 @@ class VoiceController:
             self.read_everything()
             return
 
-        # Fast-Path Action Engine (Sub-millisecond routing with zero-delay hybrid speech)
-        m_folder = _re.search(r"^(?:open|show)\s+(?:my\s+)?(.+?)(?:\s+folder)?$", low)
-        if m_folder:
-            target_name = m_folder.group(1).strip()
-            if target_name in ("desktop", "documents", "downloads", "pictures", "music", "videos") or "folder" in low:
+        # Static Action Lane — deterministic only, NO AI in routing. Precision over
+        # recall: a wrong static match executes instantly and wrong; a missed one just
+        # falls through to the AI planner below at the cost of ~1s. Never guess here.
+        norm = self._normalize_command(low)
+        route = self._static_route(norm)
+        if route:
+            kind, target = route
+            if kind == "open_folder":
                 self.broadcast_state("acting")
-                self.tts.speak_hybrid("prefix_opening.wav", f"{target_name}.")
-                resolved_path = self._resolve_folder(target_name)
+                # Rule: resolve BEFORE speaking — never announce "Opening X" before
+                # knowing X actually exists (that used to happen, then the resolver
+                # would ask "should I search your whole computer?" AFTER already
+                # saying it was opening — backwards conversation order).
+                resolved_path = self._resolve_folder(target)
                 if resolved_path:
+                    self.broadcast_state("speaking")  # audio plays now — must stay barge-in interruptible
+                    asyncio.run_coroutine_threadsafe(
+                        self.ws_server.broadcast({"v": 1, "type": "feedback",
+                                                  "text": f"Opening {target}.", "mode": self.feedback_mode}),
+                        self.loop
+                    )
+                    self.tts.speak_hybrid("prefix_opening.wav", f"{target}.")
                     try:
                         os.startfile(resolved_path)
                     except Exception as e:
                         print(f"Error opening folder {resolved_path}: {e}")
+                        self._speak_broadcast(f"I found {target}, but couldn't open it.")
+                    self.broadcast_state("idle")
+                    return
+                # Unresolved: never guess a path or speak a false "opening" — fall
+                # through silently to the AI planner below, which can search/ask.
+
+            elif kind == "close_app":
+                # Routed through the SAME ToolExecutor path as everything else, so the
+                # confirm gate actually applies — close_app is permission_level="confirm"
+                # by design; calling tool.execute() directly here used to skip that
+                # entirely and force-close apps with zero confirmation.
+                self.broadcast_state("acting")
+                result, status = self._execute_with_heartbeat("close_app", {"name": target})
+                if status == "needs_confirmation":
+                    if self.ask_confirmation(f"This will close {target}. Should I continue?"):
+                        self.broadcast_state("acting")
+                        result, status = self._execute_with_heartbeat("close_app", {"name": target}, user_confirmed=True)
+                    else:
+                        self._speak_broadcast(f"Okay, leaving {target} open.")
+                        self.broadcast_state("idle")
+                        return
+                if status == "success":
+                    self._speak_broadcast(f"Closed {target}.")
+                else:
+                    self._speak_broadcast(result.get("error") or f"I couldn't close {target}.")
                 self.broadcast_state("idle")
                 return
 
-        m_close = _re.search(r"^(?:close|quit)\s+(.+)$", low)
-        if m_close:
-            app_target = m_close.group(1).strip()
-            self.broadcast_state("acting")
-            self.tts.speak_hybrid("prefix_closing.wav", f"{app_target}.")
-            close_tool = registry.get_tool("close_app")
-            close_tool.execute({"name": app_target})
-            self.broadcast_state("idle")
-            return
+            elif kind == "open_app":
+                # `target` here is already a proven-installed app name from the index
+                # (see _lookup_indexed_app) — no AI needed to decide whether to try.
+                # Execute first, speak the real outcome after (no separate "resolve"
+                # phase exists for apps the way it does for folders — the OS launch
+                # attempt itself IS the resolution).
+                self.broadcast_state("acting")
+                result, status = self._execute_with_heartbeat("open_app", {"name": target})
+                if status == "success":
+                    self._speak_broadcast(f"Opening {target}.")
+                else:
+                    self._speak_broadcast(result.get("error") or f"I couldn't open {target}.")
+                self.broadcast_state("idle")
+                return
 
         self.broadcast_state("thinking")
         # 2. Planning
@@ -292,7 +473,15 @@ class VoiceController:
         try:
             with self._screen_cache_lock:
                 screen = dict(self._screen_cache)
-            if not screen:
+            # Verify the cache is actually for the window that's on screen RIGHT NOW,
+            # not a stale result — confirmed real bug: rapidly switching Desktop ->
+            # another app -> back to Desktop could leave the cache holding the OTHER
+            # app's content if its (slower) background walk finished after Desktop's.
+            # A cheap foreground-window check catches that; a real mismatch forces a
+            # live re-read instead of silently acting on the wrong window's items.
+            import win32gui as _win32gui
+            current_title = _win32gui.GetWindowText(_win32gui.GetForegroundWindow())
+            if not screen or (current_title and screen.get("window") != current_title):
                 screen = registry.get_tool("read_screen").execute({})
             if screen.get("success"):
                 items = screen.get("controls", [])
@@ -305,7 +494,11 @@ class VoiceController:
             pass
 
         step_results = self._run_task_loop(task_id, text, system_prompt)
-        self.tasks.update_task_status(task_id, "completed", str(step_results))
+        # _pending_question stays True only when _act_observe just parked the task
+        # (an unanswered clarifying question) — must not stomp that 'waiting_input'
+        # status back to 'completed' right after setting it.
+        if not getattr(self, "_pending_question", False):
+            self.tasks.update_task_status(task_id, "completed", str(step_results))
         self.conversation.add_exchange(text, {"speak": self.last_spoken, "plan": []}, step_results)
         plan_steps = step_results  # for the "did anything actually run?" check below
 
@@ -328,7 +521,20 @@ class VoiceController:
         else:
             self.broadcast_state("idle")
 
-    def _run_task_loop(self, task_id, goal, system_prompt, max_iterations=6):
+    # Round budgets raised 10->24->50 (2026-07-27, second raise per direction:
+    # "limit only when one step is repeated many times, not for any other kind
+    # of execution"). A numbered ceiling should never be the thing that decides
+    # whether legitimate, varied work gets to finish — only genuine lack of
+    # progress should. That's what stuck detection is for (below): the
+    # ORIGINAL loop-detector catches the exact-repeat case, and a NEW
+    # complementary one (consecutive_no_progress, driven by the "expectation_met"
+    # TVAE field) now catches the case that slipped through it — different
+    # actions each round that still never produce the expected effect (this
+    # exact pattern burned 20+ rounds on Word: never the same action twice,
+    # never real progress either). With THAT as the real stopping signal, this
+    # ceiling goes back to being a pure runaway-safety net, sized so it is
+    # essentially never hit by legitimate work.
+    def _run_task_loop(self, task_id, goal, system_prompt, max_iterations=50):
         """Plan-and-execute: for a complex multi-part goal the planner first returns a
         spoken-language `task_list` breakdown; we persist it, narrate progress ("Step 2
         of 4..."), and run each step through its own act-observe subloop. Single-part
@@ -350,16 +556,33 @@ class VoiceController:
                 conn.execute("UPDATE tasks SET plan_json = ?, current_step = 0 WHERE id = ?",
                              (_json.dumps(task_list), task_id))
             n = len(task_list)
-            self._speak_broadcast(f"I'll do this in {n} steps: " + ". ".join(f"{i+1}, {s}" for i, s in enumerate(task_list)) + ".")
+            # Don't speak the internal step breakdown ("I'll do this in N steps...",
+            # "Step 2 of 4...") — that's our own decomposition, not something the
+            # user asked to hear. Each sub-goal's own act_observe round already
+            # narrates what it's actually doing via its own "speak" text.
             all_results = []
+            # Snapshot BEFORE running: if the goal's named file already existed
+            # (a re-save of an existing file), its mere existence can't mean
+            # "goal complete" — only a file that appears DURING this run can.
+            goal_done_at_start = self._goal_file_saved(goal)
             for i, step_goal in enumerate(task_list):
                 with conn:
                     conn.execute("UPDATE tasks SET current_step = ? WHERE id = ?", (i, task_id))
-                self._speak_broadcast(f"Step {i + 1} of {n}: {step_goal}.")
                 sub_goal = (f"OVERALL GOAL: {goal}\nCURRENT STEP ({i + 1} of {n}): {step_goal}\n"
                             f"COMPLETED SO FAR: {task_list[:i]}\nDo only this step now.")
-                results = self._act_observe(task_id, sub_goal, system_prompt, max_rounds=4)
+                results = self._act_observe(task_id, sub_goal, system_prompt, max_rounds=50)
                 all_results.extend(results)
+                # A step's act-observe loop often (legitimately) completes MORE
+                # than its own step — confirmed live: step 1 finished the entire
+                # goal, then steps 2-3 re-ran the already-done work (re-typed,
+                # re-saved) because nothing checked the overall end state. If the
+                # goal's objective end state is now reached, stop here.
+                if not goal_done_at_start and self._goal_file_saved(goal):
+                    return all_results
+                if getattr(self, "_pending_question", False):
+                    # This step parked awaiting an answer — stop here instead of
+                    # marching on to later steps as if it had resolved.
+                    return all_results
                 if any(isinstance(r, dict) and r.get("cancelled") for r in results):
                     return all_results
                 if results and isinstance(results[-1], dict) and "error" in results[-1]:
@@ -367,20 +590,197 @@ class VoiceController:
                             f"Step {i + 1} hit a problem: {str(results[-1]['error'])[:120]}. Should I continue with the remaining steps?"):
                         self._speak_broadcast("Okay, stopping here.")
                         return all_results
-            self._speak_broadcast("All steps finished.")
             return all_results
 
         # Single-part goal: reuse the response we already have as round one.
         return self._act_observe(task_id, goal, system_prompt,
                                   initial_response=response, max_rounds=max_iterations)
 
-    def _act_observe(self, task_id, goal, system_prompt, initial_response=None, max_rounds=6):
+    def _verify_saved_file(self, goal: str) -> bool:
+        """Objective, code-level check for save/write goals — don't just trust the
+        model's self-reported task_step_done. Confirmed live: a click on a save
+        dialog's confirm button returned {"success": true} and the model declared
+        the goal done immediately after, without ever re-reading the screen to
+        confirm the dialog actually closed (the button was oddly labeled "Open",
+        a known quirk of Windows' shared common-dialog control) — the file never
+        actually landed on disk. Same principle as code-level loop detection:
+        the model missing its own mistake is expected sometimes, so verify
+        externally rather than trust the self-report. Returns True (nothing to
+        check, trust the model) if the goal doesn't name a specific file."""
+        import re
+        from pathlib import Path
+        # For a multi-step sub-goal, only the CURRENT STEP matters here — an
+        # earlier step (e.g. "Type the text") legitimately finishes before any
+        # file exists, and "save" appearing elsewhere in the embedded OVERALL
+        # GOAL text shouldn't block THAT step's real completion.
+        m_step = re.search(r'CURRENT STEP \(\d+ of \d+\):\s*(.+)', goal)
+        check_text = m_step.group(1) if m_step else goal
+        if "save" not in check_text.lower():
+            return True
+        m = re.search(r'\b([\w\-]+\.\w{2,5})\b', goal)
+        if not m:
+            return True
+        filename = m.group(1).strip()
+        return self._file_on_disk(filename)
+
+    def _file_on_disk(self, filename: str) -> bool:
+        """Shared disk check for save verification. Includes the OneDrive-
+        redirected folders — confirmed live: Word's preview edition saves ONLY
+        to OneDrive, and Windows itself commonly redirects Desktop/Documents
+        into OneDrive, so a save can be genuinely complete without the file
+        ever appearing under the classic local folders."""
+        from pathlib import Path
+        home = Path.home()
+        folders = [home / "Desktop", home / "Documents", home / "Downloads", home,
+                   home / "OneDrive" / "Desktop", home / "OneDrive" / "Documents", home / "OneDrive"]
+        return any((f / filename).exists() for f in folders)
+
+    def _goal_file_saved(self, goal: str) -> bool:
+        """STRICT objective completion check: True ONLY when the goal is a save
+        goal naming a specific file AND that file now exists on disk. Unlike
+        _verify_saved_file (whose True also means 'nothing to check'), this never
+        returns True by default — used to SKIP remaining task-list steps once the
+        end state is objectively reached. Confirmed live: step 1's act-observe
+        loop completed the entire goal (file saved + verified), then the outer
+        task-list loop marched into steps 2 and 3 anyway, re-typing and re-saving
+        the already-finished document."""
+        import re
+        if "save" not in goal.lower():
+            return False
+        m = re.search(r'\b([\w\-]+\.\w{2,5})\b', goal)
+        if not m:
+            return False
+        return self._file_on_disk(m.group(1).strip())
+
+    def _save_call_missing_info(self, goal: str, steps: list) -> str:
+        """Purely code-driven backstop for save_file specifically — confirmed
+        live the model can self-report missing_info: "" (its own judgment:
+        "nothing's missing") on the very round it calls save_file with a
+        completely made-up filename, when the user never gave one at all. The
+        missing_info mechanism only intercepts what the model itself flags, so
+        a self-report that misses the gap entirely defeats it — same lesson as
+        loop detection: don't trust the model to notice its own mistake for
+        something this well-defined and already twice-reported as broken.
+        Checks the actual goal text in code instead of trusting any judgment
+        call. Returns "" if a save_file step isn't being proposed this round,
+        or if the goal already contains both a filename and a location."""
+        if not any(s.get("tool") == "save_file" for s in steps):
+            return ""
+        import re
+        has_filename = bool(re.search(r'\b[\w\-]+\.\w{2,5}\b', goal))
+        has_location = bool(re.search(r'\b(desktop|documents|downloads|pictures|music|videos|folder|drive|[a-zA-Z]:\\)\b', goal, re.I))
+        missing = []
+        if not has_filename:
+            missing.append("file name")
+        if not has_location:
+            missing.append("save location")
+        return " and ".join(missing)
+
+    def _document_identity_gate(self, goal: str, all_results: list):
+        """One-time-per-task, code-driven precondition check — confirmed live
+        (2026-07-28): Windows 11 / Office apps resume a previous session's
+        document even on a genuinely fresh open_app, and the model reasonably
+        but wrongly treats that resumed content as the task's own starting
+        point — worst when the resumed doc's name happens to coincidentally
+        match a 'save it as' target named later in the goal (it did, live:
+        goal said "...save it as word_test.docx", Word resumed an unrelated
+        stale "word_test" doc from an EARLIER test run, and the model typed
+        straight into it instead of starting fresh). Modeled directly on
+        Claude Code's own Read-before-Edit gate — Anthropic's stated reason
+        for that gate is "prevents editing based on stale memory... if you
+        write, whatever was there is gone" — same failure shape, same fix:
+        verify identity BEFORE the destructive write, in code, not hoped-for
+        via prompt (same lesson as _save_call_missing_info above: the model's
+        own judgment isn't trustworthy for something this well-defined).
+        Returns None if there's nothing to check yet (no read_screen result
+        seen so far this task — caller should NOT count this as having
+        checked, and should try again once one exists), otherwise "" (checked,
+        fine) or a corrective hint string (checked, found a mismatch). Caller
+        decides WHEN to call this (only when this round's proposed steps
+        include fill_element)."""
+        import re
+        window_title = ""
+        for r in reversed(all_results):
+            if isinstance(r, dict) and "window" in r:
+                window_title = (r.get("window") or "").strip()
+                break
+        if not window_title:
+            return None  # haven't read the screen yet this task — can't check yet
+        # A document still bearing a generic default name was never given a
+        # real identity by anyone (this task or a prior one) — nothing stale
+        # to protect, across apps generically (Word/PowerPoint/Notepad++-style
+        # "Document1"/"Untitled"/"Book1"/"Presentation1" defaults).
+        if re.search(r'^(document\d*|untitled\d*|book\d*|new \d+|presentation\d*)\b', window_title, re.I):
+            return ""
+        # Explicit "I want whatever this app resumed" intent — the opposite
+        # of the bug this gate exists for. Honor it, don't second-guess it.
+        # NOTE: bare "resume" is deliberately excluded — "resume.docx" is an
+        # extremely common real filename, and \bresume\b matches inside it
+        # (word boundary triggers on the '.'), which would misfire "explicit
+        # resume intent" on literally any goal that just happens to open a
+        # file called resume.docx. Caught in testing before this shipped.
+        if re.search(r'\b(continue where|resume (my|the|our)|pick up where|last session|previous (document|file|work)|last document)\b', goal, re.I):
+            return ""
+        # Does the goal actually ask to open/edit/continue a SPECIFIC existing
+        # file (not just "save it as X" — a save target is a destination, not
+        # permission to build on whatever's already open, even if the same
+        # string happens to appear in both roles).
+        open_match = re.search(r'\b(?:open|edit|continue|update)\b[^.]{0,30}?(\b[\w\-]+\.\w{2,5}\b)', goal, re.I)
+        if open_match:
+            referenced = open_match.group(1).lower().split('.')[0]
+            if referenced and referenced in window_title.lower():
+                return ""  # resumed doc matches what was actually asked to be opened
+            return (
+                f"The document currently open ('{window_title}') doesn't match the file you were asked to work "
+                f"with ('{open_match.group(1)}'). Don't edit what's shown — verify by opening the correct file "
+                "by name before making any changes."
+            )
+        return (
+            f"The document currently open ('{window_title}') isn't blank — it looks like this app resumed a "
+            "previous session, not something related to what you were asked to create. Even if its name happens "
+            "to resemble something you'll save as later, that's coincidental leftover state, not yours to build "
+            "on. Start a genuinely new document first (this app's own 'New'/'Blank document', or a shortcut like "
+            "ctrl+n) before typing anything."
+        )
+
+    def _act_observe(self, task_id, goal, system_prompt, initial_response=None, max_rounds=50):
         """Reason -> act -> observe -> re-plan loop. Runs whatever the planner proposes,
         feeds it the REAL observed results, asks again until it declares done — because
         a single upfront plan can't know things it hasn't seen yet (element numbers,
         found file paths, dialog contents)."""
         all_results = []
         user_text = goal
+        # Loop detection (confirmed via research: this must happen in code, not
+        # the model — "the model doesn't recognize the pattern" itself). Standard
+        # definition: the exact same tool+params 3 times running. First time it's
+        # caught, force a corrective hint instead of executing a 4th time; if it
+        # happens AGAIN after that hint, stop trying and park rather than burn the
+        # whole round budget looping.
+        recent_actions = []
+        stuck_hint_given = False
+        asked_gaps = set()  # normalized missing_info strings already asked about this task
+        identity_checked = False  # see _document_identity_gate — fires at most once per task
+        # Confirmed live: even when told exactly what to ask and why, the model's
+        # own missing_info_required self-report on the ASKING round is still
+        # unreliable — it can reason "I could default this" and then still set
+        # required: true. Set when the code-driven save-file backstop (known,
+        # structurally, to always be defaultable) forces a question, so the
+        # silence-handling branch below can trust this instead of re-asking the
+        # model to self-report correctly a second time.
+        pending_is_defaultable = False
+        last_expected_effect = ""  # carried into next round's context, see below
+        # Complementary to the exact-repeat loop-detector above: catches the
+        # case it structurally can't — different actions every round that
+        # still never produce the expected effect (confirmed live: 20+ rounds
+        # on Word, never repeating an action, never actually progressing
+        # either — a round-count ceiling was the only thing that eventually
+        # stopped it). Driven by the "expectation_met" TVAE field, which is
+        # exactly the honest self-report needed for this: a real semantic
+        # progress signal instead of a syntactic repeat check.
+        consecutive_no_progress = 0
+        NO_PROGRESS_HINT_AT = 5
+        NO_PROGRESS_PARK_AT = 9
+        save_verify_failures = 0  # escalating counter, see the task_done check below
         for iteration in range(max_rounds):
             if initial_response is not None and iteration == 0:
                 response = initial_response
@@ -391,19 +791,191 @@ class VoiceController:
                 self._speak_broadcast("I'm sorry, I ran into a problem thinking that through.")
                 break
 
+            expectation_met = (response.get("expectation_met") or "").strip().lower()
+            if expectation_met in ("", "yes", "n/a"):
+                consecutive_no_progress = 0
+            else:
+                consecutive_no_progress += 1
+                if consecutive_no_progress == NO_PROGRESS_HINT_AT:
+                    user_text = (
+                        f"GOAL: {goal}\nYou've now gone {NO_PROGRESS_HINT_AT} rounds in a row where your own "
+                        "expectation_met said things weren't working out, even though you tried different "
+                        "things each time — that's still not real progress. Step back: is there a fundamentally "
+                        "different way to approach this (a different tool, a keyboard shortcut instead of "
+                        "hunting for buttons, asking the user something), or is this genuinely blocked? If truly "
+                        "blocked, say so plainly via 'speak' with an empty plan instead of continuing to try "
+                        "variations that keep not working."
+                    )
+                    continue
+                if consecutive_no_progress >= NO_PROGRESS_PARK_AT:
+                    self.tasks.park_task(task_id, "continuation", goal)
+                    self._pending_question = True
+                    self._speak_broadcast(
+                        'I\'ve tried several different ways and none of them are working — say "continue" '
+                        'and I\'ll take another approach, or let me know what\'s actually happening on screen.'
+                    )
+                    break
+
             speak_text = response.get("speak", "")
             if speak_text and speak_text != self.last_spoken:
                 self._speak_broadcast(speak_text)
 
             steps = response.get("plan", [])
+            # Explicit completion signal — replaces inferring "done" from an empty
+            # plan, which is what let a task declare itself finished right after
+            # typing text, without ever attempting to save. The model must commit
+            # to this deliberately every round rather than it falling out
+            # incidentally from "no more actions occurred to me right now".
+            task_done = bool(response.get("task_step_done", False))
+            if task_done and not self._verify_saved_file(goal):
+                # Escalating, bounded verification failure — confirmed live:
+                # Word's preview edition can ONLY save to OneDrive cloud, so no
+                # amount of retrying puts the file where the user asked; the old
+                # single fixed message looped the model on an unwinnable check.
+                # 1st failure: retry guidance. 2nd: name the likely cause and
+                # offer the honest-report exit. 3rd: stop and tell the user
+                # plainly instead of burning the rest of the round budget.
+                save_verify_failures += 1
+                if save_verify_failures >= 3:
+                    self.tasks.park_task(task_id, "continuation", goal)
+                    self._pending_question = True
+                    self._speak_broadcast(
+                        "I finished the steps, but I can't confirm the file landed where you asked — "
+                        "this app may only save to its own cloud storage. Say \"continue\" and I'll try again, "
+                        "or check the app's save location yourself."
+                    )
+                    break
+                task_done = False
+                if save_verify_failures == 1:
+                    user_text = (
+                        f"GOAL: {goal}\nYou reported this as done, but the file named in the goal isn't actually "
+                        "on disk (checked Desktop, Documents, Downloads, and OneDrive) — the save did NOT really "
+                        "complete despite what the last action's result said. Read the screen now to see what's "
+                        "actually there (a dialog that didn't close, an error, a different filename) and fix it."
+                    )
+                else:
+                    user_text = (
+                        f"GOAL: {goal}\nSecond failed check: the file is STILL not in any expected location. "
+                        "Likely cause: this app saved somewhere else entirely (its own cloud storage, or a "
+                        "location its dialog defaulted to). Do ONE of: use the save dialog's 'More options' / "
+                        "browse control to explicitly reach the exact requested folder — or, if this app "
+                        "genuinely can't save there, STOP (empty plan) and tell the user plainly where the "
+                        "file actually got saved instead. Do not keep re-saving to the same wrong place."
+                    )
+                continue
+            # Confirmed live: the model can notice info is missing (e.g. no save
+            # name/location given) and still choose to act on a silent assumption
+            # instead of asking — a prompt rule saying "ask once" isn't a
+            # guarantee, same lesson as loop detection. If it's about to act
+            # (non-empty plan) on a gap it just told us about, and we haven't
+            # already asked about this exact gap this task, force the ask now
+            # instead of trusting it to remember to ask on its own.
+            missing_info = (response.get("missing_info") or "").strip()
+            from_code_fallback = False
+            if not missing_info:
+                # Model's own self-report missed it — fall back to the
+                # deterministic, code-only check for the one case this has
+                # been confirmed to matter most for (save_file with no real
+                # filename/location ever given).
+                missing_info = self._save_call_missing_info(goal, steps)
+                from_code_fallback = bool(missing_info)
+            if missing_info and steps and missing_info.lower() not in asked_gaps:
+                asked_gaps.add(missing_info.lower())
+                # Known structurally, not from the model: save_file's filename/
+                # location always have a safe default. Don't ask the model to
+                # self-report this — it's the exact field confirmed unreliable.
+                required = False if from_code_fallback else bool(response.get("missing_info_required", False))
+                if from_code_fallback:
+                    pending_is_defaultable = True
+                user_text = (
+                    f"GOAL: {goal}\nBefore proceeding, you noted this is missing: '{missing_info}'."
+                    + (" There's no safe default — you must ask the user for it now."
+                       if required else
+                       " You may use a sensible default if the user doesn't answer, but ask ONCE first.")
+                    + " Return this round with an EMPTY plan and a 'speak' that asks for it, ending in '?'."
+                )
+                continue
             if not steps:
-                # Ended with no further action. If the last thing said was a question,
-                # that already invites a reply — don't stack another prompt on it.
-                self._pending_question = speak_text.rstrip().endswith("?")
+                is_question = speak_text.rstrip().endswith("?")
+                if is_question and missing_info:
+                    asked_gaps.add(missing_info.lower())
+                self._pending_question = is_question and not task_done
+                if task_done or not is_question:
+                    break
+                # This used to just speak the question and go idle, hoping the
+                # user's NEXT utterance (a fresh wake-word trigger) happened to
+                # answer it — no bounded listen, and if they didn't reply (or
+                # said something else entirely), the whole task's context was
+                # silently lost. Now: actually listen for the answer right here;
+                # no reply within the window parks the task (resumable via
+                # "continue") instead of dropping it.
+                self.broadcast_state("listening")
+                self.listener.stop()
+                try:
+                    wav = self.capture.capture_until_silence(no_speech_timeout_s=6.0)
+                finally:
+                    self.listener.start()
+                answer = self.stt.transcribe(wav, extra_vocab=self._vocab_hint()) if wav else ""
+                if answer:
+                    asyncio.run_coroutine_threadsafe(
+                        self.ws_server.broadcast({"v": 1, "type": "transcript", "payload": answer}),
+                        self.loop
+                    )
+                    self._pending_question = False
+                    pending_is_defaultable = False
+                    user_text = f"GOAL: {goal}\nPREVIOUS QUESTION: {speak_text}\nUSER'S ANSWER: {answer}"
+                    continue
+                # No answer. DEFAULTABLE means silence -> use defaults, per the
+                # locked ask-once-then-fallback design — NOT a parked task. Only
+                # genuinely REQUIRED questions (recipient etc.) park on silence.
+                # Trust pending_is_defaultable (set in code when OUR OWN backstop
+                # forced this question, since we know structurally it's a safe-
+                # default case) over the model's own missing_info_required
+                # self-report — confirmed live that self-report is unreliable
+                # even on the asking round itself, right after being told why.
+                was_defaultable = pending_is_defaultable or not response.get("missing_info_required", True)
+                pending_is_defaultable = False
+                if was_defaultable:
+                    self._pending_question = False
+                    user_text = (f"GOAL: {goal}\nPREVIOUS QUESTION: {speak_text}\nUSER'S ANSWER: (no reply — "
+                                 "use the defaults: Desktop, and pick a short sensible filename yourself. "
+                                 "Proceed now, do not ask again.)")
+                    continue
+                self.tasks.park_task(task_id, "clarification", speak_text)
+                self._speak_broadcast('I\'ll hold onto that — say "continue" whenever you\'re ready.')
                 break
 
+            # Precondition gate, fires at most once per task — see
+            # _document_identity_gate. Only relevant when this round is about
+            # to type real content; checked here (not earlier) so it always
+            # sees the freshest read_screen result, and only once so it can't
+            # turn into a repeating nag if the model's correction isn't
+            # immediately perfect (the existing expectation_met/stuck-detector
+            # machinery already covers continued lack of progress from here).
+            if not identity_checked and any(s.get("tool") == "fill_element" for s in steps):
+                identity_hint = self._document_identity_gate(goal, all_results)
+                if identity_hint is not None:
+                    identity_checked = True  # only counts as checked once there was something to check
+                    if identity_hint:
+                        user_text = f"GOAL: {goal}\n{identity_hint}"
+                        continue
+
+            import json as _json2
+            stuck = False
             for step in steps:
                 tool_name, params = step.get("tool"), step.get("params", {})
+                # Drop falsy-default optional keys (e.g. "submit": False) before
+                # signing — the model inconsistently includes/omits these between
+                # calls, which made byte-identical repeats of the SAME action look
+                # like different signatures and let a real stuck-loop slip past
+                # this check entirely (confirmed live: fill_element repeated 4x
+                # on the same index/value, alternating submit:false vs omitted).
+                normalized = {k: v for k, v in params.items() if v not in (False, None, "")}
+                sig = (tool_name, _json2.dumps(normalized, sort_keys=True))
+                recent_actions.append(sig)
+                if len(recent_actions) >= 3 and recent_actions[-1] == recent_actions[-2] == recent_actions[-3]:
+                    stuck = True
+                    break
                 self.broadcast_state("acting")
                 asyncio.run_coroutine_threadsafe(
                     self.ws_server.broadcast({"v": 1, "type": "action", "tool": tool_name, "params": params}),
@@ -423,10 +995,52 @@ class VoiceController:
                 all_results.append(result)
                 self.tasks.append_history(task_id, {"role": "tool", "tool": tool_name, "params": params, "result": result})
 
+            if stuck:
+                if stuck_hint_given:
+                    # Repeated the SAME action 3 times, got an explicit corrective
+                    # hint, and immediately did it again anyway — don't keep
+                    # feeding it more chances. Park (resumable via "continue") and
+                    # say so plainly rather than framing it as failure.
+                    self.tasks.park_task(task_id, "continuation", goal)
+                    self._pending_question = True
+                    self._speak_broadcast('I\'m stuck on part of that — say "continue" and I\'ll try a different way.')
+                    break
+                stuck_hint_given = True
+                recent_actions.clear()
+                user_text = (
+                    f"GOAL: {goal}\nYou just repeated the EXACT same action ({tool_name} with {params}) three "
+                    "times in a row with no progress — repeating it again will not work either. Try a "
+                    "genuinely different approach now: a different tool, different parameters, or re-read the "
+                    "screen for up-to-date element numbers before acting. If you're truly blocked, say so "
+                    "plainly via 'speak' with an empty plan instead of retrying the same thing."
+                )
+                continue
+
             import json as _json
+            # Confirmed live TWICE now, in opposite directions: (1) a flat 1500-char
+            # slice from the front silently dropped the most RECENT results once one
+            # verbose read_screen filled the budget — fill_element/send_keys success
+            # never reached the model, so it repeated them thinking they hadn't run.
+            # (2) switching to "last 4 results only" then dropped an OLDER-but-still-
+            # relevant result (the actual "Typed into Text editor" confirmation) once
+            # enough later actions piled up — the model concluded the content was
+            # NEVER typed and cancelled the save dialog to redo it. Windowing from
+            # either end is fragile for a goal whose real length isn't known in
+            # advance. Fix: no windowing or char cap at all — keep the FULL history.
+            # Each entry is already bounded at generation time (read_screen's own
+            # control/text-count limits), so this stays well inside the 32768-token
+            # context for any realistic task; the model needs the complete record
+            # to reliably track what it's actually done, not a guessed-length slice.
+            expectation_line = (
+                f"WHAT YOU EXPECTED TO HAPPEN: {last_expected_effect}\n" if last_expected_effect else ""
+            )
+            last_expected_effect = response.get("expected_effect", "") or ""
             user_text = (
-                f"GOAL: {goal}\nACTIONS YOU (PULSE) JUST PERFORMED AND THEIR RESULTS: {_json.dumps(all_results)[:1500]}\n"
-                "These are things YOU just did, not things the user or anyone else did — narrate them as "
+                f"GOAL: {goal}\n{expectation_line}"
+                f"ACTIONS YOU (PULSE) JUST PERFORMED AND THEIR RESULTS (most recent last): {_json.dumps(all_results)}\n"
+                + ("Compare the REAL results above against what you expected — set expectation_met accordingly "
+                   "next round. " if expectation_line else "")
+                + "These are things YOU just did, not things the user or anyone else did — narrate them as "
                 "'I did X' / 'I've typed X', never as 'I see X is already there'. Continue only if more steps "
                 "are genuinely needed — use the REAL results above (actual file paths, actual numbered "
                 "elements from a read_screen if one just ran; if you need to interact with something and "
@@ -435,8 +1049,40 @@ class VoiceController:
                 "it worked. If the goal is fully complete, return an empty plan and a brief closing 'speak' "
                 "confirming what you did — do not repeat something you already said this task."
             )
+            # Direct, round-specific nudge (confirmed live: the model, after a
+            # successful un-submitted fill_element, was re-reading the screen
+            # defensively instead of trusting its own "success" result and moving
+            # to save). Earlier versions of this nudge dictated raw keystrokes
+            # (ctrl+s / enter) and MISFIRED depending on dialog state — now that
+            # save_file exists as a single deterministic primitive, just point at
+            # it; it's state-independent (works whether or not a dialog is open).
+            if (tool_name == "fill_element" and not params.get("submit")
+                    and "error" not in result and "save" in goal.lower()):
+                already_saved = any(
+                    isinstance(r, dict) and str(r.get("message", "")).startswith("Saved to")
+                    for r in all_results
+                )
+                if not already_saved:
+                    user_text += (
+                        "\nThe typing above already succeeded — its result said so. Do NOT read_screen to "
+                        "double check it. Your very next action must be the save_file tool with the filename "
+                        "(and folder) from the goal — it handles the entire save dialog itself."
+                    )
+            if task_done:
+                # Model explicitly declared this step done even though it also ran
+                # actions this round — trust the explicit signal rather than forcing
+                # an extra round just to get an empty-plan confirmation.
+                break
         else:
-            self._speak_broadcast("This is taking more steps than I expected — let me know if you'd like me to keep going.")
+            # Ran out of round budget without an explicit done signal. The old
+            # phrasing here ("taking more steps than I expected") read as the app
+            # admitting it's incapable — confirmed real complaint. Park it
+            # (resumable via "continue", same mechanism as a pending question,
+            # just without one to re-ask — see pending_slot=="continuation" above)
+            # and describe it as ongoing progress, not defeat.
+            self.tasks.park_task(task_id, "continuation", goal)
+            self._pending_question = True
+            self._speak_broadcast('I\'ll keep working on that — say "continue" and I\'ll pick up where I left off.')
         return all_results
 
     def _narrate_results(self, step_results) -> str:
@@ -496,7 +1142,11 @@ class VoiceController:
         self._speak_broadcast("What would you like me to do here?" if superhero else "What would you like me to do now?")
         self.broadcast_state("listening")
         timeout = 4.0 if superhero else 6.0
-        wav = self.capture.capture_until_silence(no_speech_timeout_s=timeout)
+        self.listener.stop()
+        try:
+            wav = self.capture.capture_until_silence(no_speech_timeout_s=timeout)
+        finally:
+            self.listener.start()
         if self.capture._abort.is_set():
             # Explicitly cancelled (not a natural no-speech timeout) — e.g. a new
             # command arrived and interrupted the wait. Go straight to idle, no
@@ -511,7 +1161,11 @@ class VoiceController:
             self._speak_broadcast("No reply — let me tell you what's on your screen right now.")
             self._read_everything_flow()
             self.broadcast_state("listening")
-            wav = self.capture.capture_until_silence(no_speech_timeout_s=timeout)
+            self.listener.stop()
+            try:
+                wav = self.capture.capture_until_silence(no_speech_timeout_s=timeout)
+            finally:
+                self.listener.start()
             if self.capture._abort.is_set():
                 self.broadcast_state("idle")
                 return
@@ -530,30 +1184,18 @@ class VoiceController:
             self._speak_broadcast("I didn't hear a reply, so here's what's on your screen.")
             self._read_everything_flow()
 
-    def _resolve_folder(self, target_name: str) -> str:
-        """Smart folder resolution workflow:
-        1. Checks active screen UIA items (visible files/folders).
-        2. Checks predefined roots (Desktop, Documents, Downloads, Pictures, Music, Videos, User Home).
-        3. If not found in predefined roots, asks user for confirmation before performing full drive search.
-        4. Performs search_file walk if user confirms or gives no reply.
+    def _resolve_folder(self, target_name: str) -> str | None:
+        """Folder resolution for the static lane:
+        1. Checks predefined roots (Desktop, Documents, Downloads, Pictures, Music, Videos, User Home).
+        2. If not found, asks for confirmation before a full drive search.
+        3. Performs a search_file walk if the user confirms.
+        Returns None — never a guessed path — if nothing is actually found. Callers
+        must treat None as "unresolved", not attempt to open it.
         """
         from pathlib import Path
         target_clean = target_name.strip().lower().replace("my ", "").replace(" folder", "")
         home = Path.home()
 
-        # 1. Check screen UIA controls (visible elements)
-        try:
-            with self._screen_cache_lock:
-                screen = dict(self._screen_cache)
-            if screen and screen.get("controls"):
-                for item in screen.get("controls", []):
-                    if target_clean in item.lower():
-                        # Extract name or handle if visible
-                        pass
-        except Exception:
-            pass
-
-        # 2. Check predefined roots (<10ms)
         predefined_roots = [
             home / "Desktop",
             home / "Documents",
@@ -574,9 +1216,8 @@ class VoiceController:
                 except Exception:
                     pass
 
-        # 3. Confirmation before broad disk walk
         should_search_all = self.ask_confirmation(
-            f"I couldn't find the {target_name} folder on your screen or main folders. Should I search your whole computer?"
+            f"I couldn't find the {target_name} folder in your main folders. Should I search your whole computer?"
         )
         if should_search_all:
             search_tool = registry.get_tool("search_file")
@@ -584,7 +1225,7 @@ class VoiceController:
             if res and res.get("matches"):
                 return res["matches"][0]["path"]
 
-        return str(home / target_clean.capitalize())
+        return None
 
     def train_wake_word(self, word: str = None):
         """Voice-guided wake-word personalization: record 5 samples, retrain, hot-swap.
@@ -615,9 +1256,15 @@ class VoiceController:
             root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
             path = os.path.join(root, 'models', 'assets', name_or_path)
         data, fs = sf.read(path, dtype='float32')
+        # sd.wait()/blocking playback is a confirmed Windows-specific PortAudio
+        # bug (python-sounddevice #283) that cuts audio off slightly before the
+        # real end — duration-based waiting on a silence-padded buffer doesn't
+        # have this problem (see core/voice/tts.py's _wait_for_playback).
+        from core.voice.tts import pad_silence
+        data = pad_silence(data, fs)
         sd.stop()
         sd.play(data, fs)
-        sd.wait()
+        time.sleep(len(data) / fs)
 
     _WORD_PROMPT_TEXT = {
         "say": lambda w: f"Say {w} now.",
@@ -854,6 +1501,19 @@ class VoiceController:
                                               "status": "done", "text": f"✓ Wake word trained: {word}"}),
                     self.loop
                 )
+                # Two-stage verification (the same pattern Alexa/Google Voice Match use):
+                # train a lightweight per-user verifier on these exact real enrollment
+                # recordings vs. synthesized non-wake-word speech. openWakeWord re-scores
+                # any candidate the base model flags through this instead of trusting the
+                # base model alone — this is what actually tells "this enrolled voice
+                # saying the wake word" apart from "anyone/anything that merely sounds
+                # similar," which a single shared base model can't do on its own. Best-
+                # effort: a failure here must never undo the wake-word training success
+                # that already completed and was already announced above.
+                try:
+                    self._train_verifier(outdir, root)
+                except Exception as e:
+                    print(f"Verifier training skipped (non-fatal): {e}")
         except Exception as e:
             # Only reachable now for a genuine swap-step failure on a model that DID
             # export successfully (e.g. a corrupt/partial onnx write) — "restart to
@@ -871,14 +1531,120 @@ class VoiceController:
             self.listener.start()
         self.broadcast_state("idle")
 
-    def _refresh_screen_cache(self):
-        """Runs the actual UIA walk (the expensive part) off the polling loop's own
-        thread, so a slow window never delays the next foreground-change check."""
+    def _train_verifier(self, sample_dir, root):
+        """Trains openWakeWord's per-user logistic-regression verifier on the real
+        enrollment recordings just collected (positives) vs. a handful of synthesized
+        non-wake-word phrases (negatives), and saves it as models/pulse_verifier.joblib.
+        WakeListener picks it up automatically on its next (re)start if present."""
+        import glob, tempfile, shutil
+        import scipy.io.wavfile as wavf
+        from scipy.signal import resample_poly
+        import numpy as np
+        import openwakeword
+
+        positive_clips = glob.glob(os.path.join(sample_dir, '*.wav'))
+        if len(positive_clips) < 3:
+            print("Verifier: not enough enrollment samples yet, skipping.")
+            return
+
+        # Ordinary speech, deliberately NOT close sound-alikes of the wake word (those
+        # belong in the base model's own negative training set) — this just needs to
+        # sound like "a person talking", so the verifier learns the enrolled voice's
+        # actual vocal characteristics rather than re-learning wake-word discrimination
+        # the base model already handles.
+        NEG_PHRASES = ["okay", "hello there", "thank you very much", "good morning",
+                       "what time is it", "turn off the lights", "can you help me"]
+        tmpdir = tempfile.mkdtemp(prefix="pulse_verifier_neg_")
         try:
-            screen = registry.get_tool("read_screen").execute({})
+            negative_clips = []
+            for i, phrase in enumerate(NEG_PHRASES):
+                pcm24 = self.tts._synth_sentence(phrase)
+                if len(pcm24) == 0:
+                    continue
+                pcm16 = resample_poly(pcm24, 2, 3)  # Kokoro's 24kHz -> openWakeWord's 16kHz
+                pcm16_int = np.clip(pcm16 * 32767, -32768, 32767).astype(np.int16)
+                path = os.path.join(tmpdir, f'neg_{i}.wav')
+                wavf.write(path, 16000, pcm16_int)
+                negative_clips.append(path)
+
+            if len(negative_clips) < 3:
+                print("Verifier: negative-clip synthesis failed, skipping.")
+                return
+
+            tmp_out = os.path.join(tmpdir, 'candidate_verifier.joblib')
+            openwakeword.train_custom_verifier(
+                positive_reference_clips=positive_clips,
+                negative_reference_clips=negative_clips,
+                output_path=tmp_out,
+                model_name=os.path.join(root, 'models', 'pulse.onnx'),
+                inference_framework="onnx",
+            )
+
+            # Safety gate: measured directly — a verifier trained when the base model's
+            # own confidence on these clips is inconsistent can score a GENUINE positive
+            # near zero (0.00007 in testing), which is worse than having no verifier at
+            # all. Never activate one without proving it actually recognizes the voice
+            # it was just trained on.
+            passed = self._validate_verifier(tmp_out, positive_clips, root)
+            required = max(1, len(positive_clips) - 1)  # tolerate one bad clip, not more
+            if passed < required:
+                print(f"Verifier validation failed ({passed}/{len(positive_clips)} positives recognized, "
+                      f"need {required}) — discarding. Wake detection keeps using the base model alone.")
+                return
+
+            out_path = os.path.join(root, 'models', 'pulse_verifier.joblib')
+            shutil.move(tmp_out, out_path)
+            print(f"Verifier trained and validated: {out_path} "
+                  f"({passed}/{len(positive_clips)} positives, {len(negative_clips)} negatives)")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def _validate_verifier(self, verifier_path, positive_clips, root) -> int:
+        """Re-scores the same real enrollment clips through base-model+verifier and
+        counts how many are still recognized (score > 0.5). Isolated Model instance —
+        never touches self.listener.owwModel."""
+        import openwakeword
+        import soundfile as sf
+        model = openwakeword.Model(
+            wakeword_models=[os.path.join(root, 'models', 'pulse.onnx')],
+            inference_framework="onnx",
+            custom_verifier_models={"pulse": verifier_path},
+            custom_verifier_threshold=0.1,
+        )
+        passed = 0
+        for clip in positive_clips:
+            model.reset()
+            audio, sr = sf.read(clip, dtype='int16')
+            best = 0.0
+            for start in range(0, max(0, len(audio) - 1280), 1280):
+                pred = model.predict(audio[start:start + 1280])
+                for k, v in pred.items():
+                    if "pulse" in k:
+                        best = max(best, v)
+            if best > 0.5:
+                passed += 1
+        return passed
+
+    def _refresh_screen_cache(self, generation):
+        """Runs the actual UIA walk (the expensive part) off the polling loop's own
+        thread, so a slow window never delays the next foreground-change check.
+        Guarded by `generation`: a real, confirmed race — switching Desktop -> another
+        app -> back to Desktop quickly could spawn a slow walk for the middle app that
+        finishes AFTER the newer Desktop walk and clobbers the cache with the wrong
+        window's content. Only the walk started by the MOST RECENT foreground change
+        is allowed to actually write the cache; older ones are discarded even if they
+        finish later."""
+        try:
+            # _update_index=False: this runs continuously on its own 0.5s
+            # polling schedule, independent of any active task — confirmed
+            # live it can fire mid-task and silently corrupt the element
+            # indices an in-progress fill_element/click_element is about to
+            # use (see the matching note in ReadScreenTool.execute).
+            screen = registry.get_tool("read_screen").execute({"_update_index": False})
             if screen.get("success"):
                 with self._screen_cache_lock:
-                    self._screen_cache = screen
+                    if generation == self._screen_cache_generation:
+                        self._screen_cache = screen
         except Exception:
             pass
 
@@ -897,7 +1663,10 @@ class VoiceController:
                 continue
             if hwnd and hwnd != last_hwnd:
                 last_hwnd = hwnd
-                threading.Thread(target=self._refresh_screen_cache, daemon=True).start()
+                with self._screen_cache_lock:
+                    self._screen_cache_generation += 1
+                    gen = self._screen_cache_generation
+                threading.Thread(target=self._refresh_screen_cache, args=(gen,), daemon=True).start()
 
     def _narration_loop(self):
         import win32gui
@@ -965,14 +1734,34 @@ class VoiceController:
             import sounddevice as sd
             path = os.path.join(os.path.dirname(__file__), '..', '..', 'models', 'superhero_on.wav')
             data, fs = sf.read(os.path.abspath(path))
+            # See _play_asset — sd.wait() cuts off early on Windows (confirmed
+            # PortAudio bug, python-sounddevice #283); duration-based wait on
+            # padded audio doesn't have this problem.
+            from core.voice.tts import pad_silence
+            data = pad_silence(data, fs)
             sd.play(data, fs)
-            sd.wait()
+            time.sleep(len(data) / fs)
         except Exception as e:
             print(f"Superhero chime failed: {e}")
 
+    # Tools that read/act on a specific window's UI elements — these are the
+    # ones that need the "remembered target" window pulled to front first.
+    _FOCUS_SENSITIVE_TOOLS = frozenset({"read_screen", "fill_element", "click_element", "send_keys", "save_file"})
+
     def _execute_with_heartbeat(self, tool_name, params, user_confirmed=False):
         """Continuous-feedback rule: no silence >4s while busy. Speaks a short filler
-        if a tool takes longer than that (page loads, slow lookups)."""
+        if a tool takes longer than that (page loads, slow lookups).
+
+        Also the sole enforcement point for ensure_target_focused(): this method
+        is exclusively AI-driven task execution (every _act_observe tool call and
+        the static open/close routes go through it), unlike the passive
+        background screen-context cache which calls read_screen directly and
+        must NEVER force a window to front. Confirmed live this was a real risk
+        — bringing the app forward belongs here, "on top only when actually in
+        use", not inside the tools themselves where a passive caller could
+        trigger it too."""
+        if tool_name in self._FOCUS_SENSITIVE_TOOLS:
+            ensure_target_focused()
         def filler():
             if not self.tts.is_playing:
                 self.tts.speak_now("Still working on it.")

@@ -11,6 +11,18 @@ from concurrent.futures import ThreadPoolExecutor
 
 warnings.filterwarnings("ignore")
 
+def pad_silence(pcm: np.ndarray, samplerate: int, pad_s: float = 0.25) -> np.ndarray:
+    """Appends real trailing silence so any playback-end timing imprecision
+    (confirmed: Windows-specific PortAudio early-cutoff, device cold-start
+    latency, Python scheduling jitter) can only ever eat into silence, never
+    real speech — 0.25s is well past typical Windows audio latency (order
+    100-200ms) while staying short enough not to feel like a pause between
+    sentences."""
+    if pcm is None or len(pcm) == 0:
+        return pcm
+    pad = np.zeros(int(samplerate * pad_s), dtype=pcm.dtype)
+    return np.concatenate([pcm, pad])
+
 def trim_silence(pcm: np.ndarray, threshold: float = 0.01) -> np.ndarray:
     """Trim leading and trailing digital zero-padding/silence from generated PCM chunk,
     eliminating artificial punctuation pauses."""
@@ -36,7 +48,28 @@ class TTSService:
         self.is_playing = False
         self.last_active = 0.0  # for AEC-lite: audio can still be resonating briefly after playback ends
         self.assets_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'models', 'assets'))
-        
+
+    # Researched (2026-07-27): sd.wait()/blocking=True is a KNOWN Windows bug —
+    # python-sounddevice issue #283 confirms it cuts playback off slightly
+    # before the real end on Windows specifically, and that manual duration-
+    # based waiting (sd.play() + time.sleep()) does NOT have this problem. So
+    # duration-based waiting isn't a workaround to replace — it's the correct
+    # approach here; switching to sd.wait() would make clipping WORSE, not
+    # better. What actually needs fixing is precision: any timing slop (device
+    # cold-start latency, this same Windows early-cutoff behavior, scheduling
+    # jitter) must never be able to reach into real speech. Solved at the
+    # source instead of guessed at here — see _pad_silence — every buffer
+    # this waits on already has real trailing silence baked in, so an
+    # early-by-a-few-hundred-ms cutoff can only ever eat silence.
+    def _wait_for_playback(self, audio, samplerate):
+        deadline = time.time() + len(audio) / samplerate
+        while time.time() < deadline:
+            if self.cancel_event.is_set():
+                sd.stop()
+                return
+            self.last_active = time.time()
+            time.sleep(0.02)
+
     def _chunk_text(self, text):
         # Split on sentence boundaries to allow streaming
         sentences = re.split(r'(?<=[.!?]) +', text)
@@ -48,7 +81,7 @@ class TTSService:
             if not chunks:
                 return np.zeros(0, dtype=np.float32)
             raw_pcm = np.concatenate(chunks).astype(np.float32)
-            return trim_silence(raw_pcm)
+            return pad_silence(trim_silence(raw_pcm), 24000)
         except Exception as e:
             print(f"Sentence synth error ('{sentence}'): {e}")
             return np.zeros(0, dtype=np.float32)
@@ -94,12 +127,7 @@ class TTSService:
                 if audio is None:
                     break
                 sd.play(audio, 24000)
-                while sd.get_stream() and sd.get_stream().active:
-                    if self.cancel_event.is_set():
-                        sd.stop()
-                        break
-                    self.last_active = time.time()
-                    time.sleep(0.02)
+                self._wait_for_playback(audio, 24000)
         except Exception as e:
             print(f"TTS Error: {e}")
         finally:
@@ -121,7 +149,8 @@ class TTSService:
         try:
             # 1. Load pre-baked prefix audio (16kHz WAV from generate_assets)
             prefix_data, fs_prefix = sf.read(prefix_path, dtype='float32')
-            
+            prefix_data = pad_silence(prefix_data, fs_prefix)
+
             # Start dynamic text synthesis in background thread
             dynamic_audio_container = []
             def synth_dynamic():
@@ -133,12 +162,7 @@ class TTSService:
 
             # 2. Play pre-baked prefix instantly (16kHz)
             sd.play(prefix_data, fs_prefix)
-            while sd.get_stream() and sd.get_stream().active:
-                if self.cancel_event.is_set():
-                    sd.stop()
-                    break
-                self.last_active = time.time()
-                time.sleep(0.02)
+            self._wait_for_playback(prefix_data, fs_prefix)
 
             synth_thread.join(timeout=3.0)
 
@@ -146,12 +170,7 @@ class TTSService:
             if dynamic_audio_container and len(dynamic_audio_container[0]) > 0 and not self.cancel_event.is_set():
                 dyn_pcm = dynamic_audio_container[0]
                 sd.play(dyn_pcm, 24000)
-                while sd.get_stream() and sd.get_stream().active:
-                    if self.cancel_event.is_set():
-                        sd.stop()
-                        break
-                    self.last_active = time.time()
-                    time.sleep(0.02)
+                self._wait_for_playback(dyn_pcm, 24000)
         except Exception as e:
             print(f"speak_hybrid error: {e}")
         finally:
@@ -174,6 +193,6 @@ class TTSService:
             pcm = self._synth_sentence(text)
             if len(pcm) > 0:
                 sd.play(pcm, 24000)
-                sd.wait()
+                self._wait_for_playback(pcm, 24000)
         except Exception as e:
             print(f"speak_now error: {e}")

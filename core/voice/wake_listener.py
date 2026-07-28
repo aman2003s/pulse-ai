@@ -37,21 +37,27 @@ class WakeListener:
                     raw_score = val
                     break
 
-            # Decide off the PEAK score over a short sliding window (~240ms), not a single
-            # 80ms frame in isolation. A genuine wake word's confidence ramps up over a
-            # couple of frames — a single frame can dip just under threshold by chance and
-            # cause a missed detection even though the word was said correctly. This is the
-            # same smoothing production keyword-spotters (Porcupine, Alexa) use instead of
-            # frame-by-frame decisions.
+            # Sustain check: require at least 2 of the last 4 raw 80ms frames (~320ms) to
+            # clear threshold, in BOTH idle and speaking states — not any single frame in
+            # isolation. A genuine "Pulse" naturally spans several consecutive high-confidence
+            # frames, so this still tolerates one momentary mid-word dip. This replaces an
+            # older max()-over-window ("smoothed score") approach that had two real bugs:
+            # (1) idle state had no sustain check at all — one noisy ambient frame crossing
+            # 0.3 triggered instantly; (2) the speaking-mode anti-echo guard counted the
+            # max-of-window score rather than raw per-frame scores, so a single spike stayed
+            # "high" for 2 extra frames after the fact and could satisfy the "2 consecutive
+            # frames" requirement on its own — defeating the guard it was meant to enforce.
+            # Counting raw threshold-crossings within a short rolling window instead requires
+            # genuinely independent high-confidence frames in both states.
             window = getattr(self, '_score_window', None)
             if window is None:
                 from collections import deque
-                window = self._score_window = deque(maxlen=3)
+                window = self._score_window = deque(maxlen=4)
             window.append(raw_score)
-            score = max(window)
 
             speaking = self.is_speaking_fn()
             threshold = 0.93 if speaking else 0.3
+            high_count = sum(1 for s in window if s > threshold)
 
             # TEMPORARY diagnostic — same "watch it live" approach that found the training
             # bugs. Reusing this SAME callback/stream (not a second parallel InputStream,
@@ -64,24 +70,15 @@ class WakeListener:
                 self._last_heartbeat = now_hb
                 print(f"[mic heartbeat] rms={rms:.1f}")
             if raw_score > 0.05 or rms > 300:
-                print(f"[wake score] raw={raw_score:.3f} smoothed={score:.3f} "
+                print(f"[wake score] raw={raw_score:.3f} high_count={high_count}/{len(window)} "
                       f"threshold={threshold:.2f} speaking={speaking} rms={rms:.1f}")
 
-            if score > threshold:
-                # While Pulse is talking, require the score to stay high for 2 consecutive
-                # 80ms frames (not just one spike) before treating it as a real interrupt —
-                # cuts down on ambient-noise/echo false-triggers without adding perceptible
-                # delay to a genuine "Pulse" said over playback.
-                self._high_streak = getattr(self, '_high_streak', 0) + 1
-                sustained = (not speaking) or self._high_streak >= 2
-                if sustained:
-                    now = time.time()
-                    if now - getattr(self, '_last_trigger', 0) > 2.0:  # debounce
-                        self._last_trigger = now
-                        self._high_streak = 0
-                        self.callback()
-            else:
-                self._high_streak = 0
+            if high_count >= 2:
+                now = time.time()
+                if now - getattr(self, '_last_trigger', 0) > 2.0:  # debounce
+                    self._last_trigger = now
+                    window.clear()
+                    self.callback()
         except Exception as e:
             # Never crash the audio thread on a bad frame, but don't go fully silent
             # either — a callback that's erroring every frame would otherwise look
@@ -97,7 +94,23 @@ class WakeListener:
         
         if not self.owwModel:
             print(f"Loading openWakeWord model '{self.model_name}'...")
-            self.owwModel = Model(wakeword_models=[self.model_path], inference_framework="onnx")
+            # Per-user verifier (trained in controller._train_verifier from real
+            # enrollment recordings): openWakeWord re-scores any candidate the base
+            # model flags through this instead of trusting the base model alone. Optional
+            # — falls back to base-model-only scoring until the user has trained once.
+            verifier_path = os.path.join(os.path.dirname(self.model_path), f'{self.model_name}_verifier.joblib')
+            custom_verifiers = {self.model_name: verifier_path} if os.path.exists(verifier_path) else {}
+            if custom_verifiers:
+                print(f"Loading per-user verifier: {verifier_path}")
+            # vad_threshold gates predictions on openWakeWord's own bundled Silero VAD
+            # (ONNX, already local — no extra download): it looks at the ~0.4-0.56s of
+            # VAD history before the current frame and zeroes the wake-word score outright
+            # if that window wasn't classified as speech. This is what actually rejects
+            # non-speech noise (air, fans, typing) — the raw/sustain-window logic in
+            # _audio_callback only ever sees genuine speech-gated scores once this is on.
+            self.owwModel = Model(wakeword_models=[self.model_path], inference_framework="onnx",
+                                   vad_threshold=0.5, custom_verifier_models=custom_verifiers,
+                                   custom_verifier_threshold=0.1)
 
         self.is_running = True
         self.stream = sd.InputStream(

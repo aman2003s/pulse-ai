@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from core.db import get_db
 from core.tools.registry import registry, Tool
-from core.adapters.win.focus import bring_app_to_front, bring_explorer_folder_to_front
+from core.adapters.win.focus import bring_app_to_front, bring_explorer_folder_to_front, find_existing_window, _force_foreground, remember_target
 
 class OpenAppTool(Tool):
     name: str = "open_app"
@@ -44,22 +44,51 @@ class OpenAppTool(Tool):
         
         if not match or match[1] < 60:
             # Fallback: try raw name directly (e.g. "notepad.exe" or "calc")
+            name_hint = app_name.split()[0]
+            # Reuse-if-already-open, checked BEFORE ever launching — confirmed
+            # real bug otherwise: every "open X" kept spawning a new window/tab
+            # even when X was already open. The AI gets told this explicitly
+            # (already_running) so it can decide whether the existing window is
+            # safe to type into or a new tab is warranted, rather than us
+            # silently guessing either way.
+            existing = find_existing_window(name_hint)
+            if existing:
+                _force_foreground(existing)
+                remember_target(existing)
+                return {"success": True, "app": app_name, "path": "System PATH", "already_running": True}
             try:
                 launched_at = time.time()
                 os.startfile(app_name)
-                threading.Thread(target=bring_app_to_front, args=(app_name.split()[0], launched_at), daemon=True).start()
-                return {"success": True, "app": app_name, "path": "System PATH"}
+                # Block until actually foregrounded (was fire-and-forget on a
+                # background thread) — confirmed live via raw prompt/response trace:
+                # a read_screen in the SAME round right after open_app was racing
+                # ahead of this and reading whichever window had focus BEFORE the
+                # launch, twice in a row, before the real window ever appeared.
+                # open_app's success result is supposed to mean "ready to interact
+                # with" — returning before that's true was the actual bug.
+                bring_app_to_front(name_hint, launched_at)
+                remember_target(find_existing_window(name_hint))
+                return {"success": True, "app": app_name, "path": "System PATH", "already_running": False}
             except Exception:
                 return {"error": f"Could not find an app matching '{app_name}'."}
-            
+
         best_name = match[0]
         app_path = names_to_paths[best_name]
+        name_hint = best_name.split()[0]
+
+        existing = find_existing_window(name_hint)
+        if existing:
+            _force_foreground(existing)
+            remember_target(existing)
+            return {"success": True, "app": best_name, "path": app_path, "already_running": True}
 
         try:
             launched_at = time.time()
             os.startfile(app_path)
-            threading.Thread(target=bring_app_to_front, args=(best_name.split()[0], launched_at), daemon=True).start()
-            return {"success": True, "app": best_name, "path": app_path}
+            # See note above — block until foregrounded instead of racing read_screen.
+            bring_app_to_front(name_hint, launched_at)
+            remember_target(find_existing_window(name_hint))
+            return {"success": True, "app": best_name, "path": app_path, "already_running": False}
         except Exception as e:
             return {"error": str(e)}
 
@@ -248,7 +277,8 @@ class OpenFileTool(Tool):
             else:
                 launched_at = time.time()
                 hint = os.path.splitext(os.path.basename(path))[0]
-                threading.Thread(target=bring_app_to_front, args=(hint, launched_at), daemon=True).start()
+                bring_app_to_front(hint, launched_at)
+                remember_target(find_existing_window(hint))
             return {"success": True, "path": path}
         except Exception as e:
             return {"error": str(e)}

@@ -38,10 +38,22 @@ class PulseOrchestrator:
         MODELS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'models'))
         MODEL_PATH = os.path.join(MODELS_DIR, 'gemma-4-E4B-it-Q4_K_M.gguf')
         SERVER_EXE = os.path.join(MODELS_DIR, 'llama-server.exe')
+        MMPROJ_PATH = os.path.join(MODELS_DIR, 'mmproj.gguf')
 
         if not os.path.exists(SERVER_EXE):
             logger.error("llama-server not found.")
             return
+
+        # LookAtScreenTool (system_tools.py) needs the server to actually
+        # accept image input — passing --mmproj is what turns on multimodal
+        # handling in llama-server's /v1/chat/completions endpoint; without
+        # it the server only ever sees text, same as before this existed.
+        # Optional (not a hard requirement) so a fresh checkout without the
+        # ~950MB projector downloaded still runs fine text-only, same as it
+        # always has — this only upgrades capability when the file is present.
+        mm_args = ["--mmproj", MMPROJ_PATH] if os.path.exists(MMPROJ_PATH) else []
+        if not mm_args:
+            logger.warning("mmproj.gguf not found — running text-only, vision tools will fail.")
 
         import httpx
         for port in (8081, 8082, 8083):  # M7.2: fall back if port is taken
@@ -53,7 +65,19 @@ class PulseOrchestrator:
                 # if the next request gets routed to a different, cold slot. Pinning to
                 # a single slot guarantees the same cache is reused every time (measured:
                 # ~0.8s warm vs ~14s cold for this app's real ~2800-token system prompt).
-                [SERVER_EXE, "-m", MODEL_PATH, "--port", str(port), "-c", "8192", "-ngl", "99", "--parallel", "1"],
+                # -c: Gemma 4 E4B supports up to 128K natively. Each individual call's
+                # ACTUAL usage is bounded by design — system prompt (~3-4K tokens) +
+                # small conversation history + screen context + this round's action
+                # summary (already hard-capped at 1500 chars in controller.py) — a
+                # realistic worst case lands in the low thousands, not tens of
+                # thousands. 32768 (25% of the model's max) is a deliberate multiple
+                # of that realistic peak, not the full 128K: llama.cpp PRE-ALLOCATES
+                # the KV cache at this size regardless of actual per-call usage, so
+                # going all the way to 128K would burn memory for headroom nobody
+                # needs, working against "fast" on the project's stated 8GB-RAM
+                # target. Raise further only if you have concrete evidence a task is
+                # actually filling this.
+                [SERVER_EXE, "-m", MODEL_PATH, "--port", str(port), "-c", "32768", "-ngl", "99", "--parallel", "1"] + mm_args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
@@ -81,6 +105,21 @@ class PulseOrchestrator:
             self.start_llama()
 
     async def main_loop(self):
+        # Refresh the installed-apps index in the background (via Get-StartApps — not
+        # a .lnk scan, which misses every UWP/MSIX-packaged app: Notepad, Calculator,
+        # Paint, Photos, Settings, Snipping Tool all ship this way on modern Windows
+        # and were previously invisible to open_app). Runs concurrently with the
+        # llama-server startup below (which takes far longer) so it never adds
+        # perceptible delay, and it's fresh every launch instead of a one-time
+        # manual script run.
+        from core.adapters.win.app_indexer import build_app_index
+        threading.Thread(target=build_app_index, daemon=True).start()
+
+        # DB schema migrations — synchronous and first, since VoiceController's
+        # __init__ (constructed below) already reads from the DB.
+        from core.db import init_db
+        init_db()
+
         # Start llama-server
         self.start_llama()
         
@@ -176,8 +215,16 @@ def ensure_single_instance():
     except OSError:
         # Already running — silently exit. No popup: the UI will just connect to
         # the existing backend on its own reconnect loop.
+        # os._exit (not sys.exit): confirmed real issue — a duplicate launch
+        # spawned by run.bat's own racy pre-check lost this lock but then sat
+        # alive indefinitely at 0% CPU instead of actually terminating. sys.exit
+        # raises a normal, catchable SystemExit that unwinds through Python's
+        # exception/cleanup machinery; os._exit calls the OS exit syscall directly
+        # with zero Python-level cleanup, so it cannot get stuck no matter what
+        # else is going on this early in startup.
         print("Pulse is already running. Exiting silently.")
-        sys.exit(0)
+        sys.stdout.flush()
+        os._exit(0)
 
 if __name__ == "__main__":
     lock_fd = ensure_single_instance()

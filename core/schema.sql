@@ -6,6 +6,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     plan_json TEXT,
     history_json TEXT,
     result TEXT,
+    pending_slot TEXT,
+    pending_question TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
