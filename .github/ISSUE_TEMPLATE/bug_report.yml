@@ -1,0 +1,62 @@
+name: Bug report
+description: Something Pulse did wrong, or didn't do at all
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. The more concrete detail you give (what you actually said, what actually happened), the faster this can get fixed — see [Known Limitations](../../README.md#known-limitations) first in case it's already a known gap.
+
+  - type: textarea
+    id: what-you-asked
+    attributes:
+      label: What did you ask Pulse to do?
+      description: The exact phrase you said or typed, as close to verbatim as you can remember.
+      placeholder: "\"Pulse, open my resume.docx and add a new line at the end\""
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened?
+      description: Be specific — "it didn't work" is much less useful than "it opened the app, then said 'I'm stuck' after about 30 seconds."
+    validations:
+      required: true
+
+  - type: textarea
+    id: app
+    attributes:
+      label: Which application were you interacting with?
+      placeholder: "e.g. Microsoft Word (Preview edition), Notepad, Chrome"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: If possible, paste the relevant section of `%APPDATA%\Pulse\pulse.log` from around when this happened. This is the single most useful thing you can attach.
+      render: text
+
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      placeholder: "e.g. Windows 11 23H2"
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Anything else?
+      description: Screenshots, screen recordings, or anything else that helps reproduce this.

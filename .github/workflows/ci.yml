@@ -1,0 +1,33 @@
+name: CI
+
+# Deliberately lightweight for now: Pulse's real behavior depends on local
+# GGUF models, a GPU, and live Windows UI Automation — none of which are
+# practical to run in a hosted CI runner. This checks the things that CAN be
+# verified without that: the codebase actually parses, and the standalone
+# integration scripts in tests/ that don't require the full stack still run.
+# See CONTRIBUTING.md — converting tests/*.py into a real pytest suite with
+# proper mocking is a good first contribution that would let this grow.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  syntax-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check all Python files parse
+        shell: bash
+        run: |
+          set -e
+          fail=0
+          for f in $(find . -name "*.py" -not -path "./venv/*" -not -path "./ui/*" -not -path "./.git/*"); do
+            python -c "import ast; ast.parse(open('$f', encoding='utf-8').read())" || { echo "FAILED: $f"; fail=1; }
+          done
+          exit $fail
