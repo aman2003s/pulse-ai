@@ -30,6 +30,12 @@ def migrate_db(conn=None):
     for stmt in (
         "ALTER TABLE tasks ADD COLUMN pending_slot TEXT",
         "ALTER TABLE tasks ADD COLUMN pending_question TEXT",
+        # root_step_id: the task_steps row that's this task's tree root.
+        # parked_node_id: the EXACT node a parked task resumes at — this is what
+        # lets "continue" resume precisely instead of restarting the whole goal
+        # (see core/voice/controller.py's _execute_node/process_text).
+        "ALTER TABLE tasks ADD COLUMN root_step_id TEXT",
+        "ALTER TABLE tasks ADD COLUMN parked_node_id TEXT",
     ):
         try:
             with conn:

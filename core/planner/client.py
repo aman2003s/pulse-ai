@@ -5,7 +5,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 class PlannerClient:
-    def __init__(self, port=8081, timeout=30.0):
+    def __init__(self, port=8081, timeout=90.0):
         self.url = f"http://127.0.0.1:{port}/completion"
         # Separate endpoint for vision calls (see analyze_image) — llama-server's
         # raw /completion endpoint expects a hand-built Gemma chat-template
