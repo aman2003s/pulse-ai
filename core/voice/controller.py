@@ -1278,8 +1278,45 @@ class VoiceController:
             self._speak_broadcast("I didn't hear a reply, so here's what's on your screen.")
             self._read_everything_flow()
 
+    def _current_explorer_folder(self):
+        """If a File Explorer window is currently focused, returns its actual
+        current folder path via the Shell.Application COM API — matching by
+        HWND against the foreground window, not by guessing from the window
+        title (which often shows just the folder name, ambiguous once more
+        than one folder shares it). Returns None for anything else (no
+        Explorer focused, or the lookup fails), never a guess. Deliberately
+        NOT implemented via parsing the address-bar UIA control: that control
+        varies enough across Explorer's own view modes (breadcrumb vs. edit
+        vs. search) that a text-scrape would need its own retry-and-adapt
+        logic  Shell.Application gives the real path directly, no parsing."""
+        try:
+            import win32gui
+            import win32com.client
+            hwnd = win32gui.GetForegroundWindow()
+            if not hwnd:
+                return None
+            shell = win32com.client.Dispatch("Shell.Application")
+            for window in shell.Windows():
+                try:
+                    if window.HWND == hwnd:
+                        return window.Document.Folder.Self.Path
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
     def _resolve_folder(self, target_name: str) -> str | None:
         """Folder resolution for the static lane:
+        0. If a File Explorer window is currently open and focused, checks
+           whether the target is a subfolder of THAT window's actual current
+           folder — e.g. "open the emails folder" while an Explorer window is
+           already sitting inside the parent folder that contains it. Reads
+           the real current path via Shell.Application (see
+           _current_explorer_folder), queried fresh every call — never from
+           the passive screen-context cache, which can lag up to ~1s behind
+           the real focused window and would risk resolving against the
+           WRONG folder if trusted here.
         1. Checks predefined roots (Desktop, Documents, Downloads, Pictures, Music, Videos, User Home).
         2. If not found, asks for confirmation before a full drive search.
         3. Performs a search_file walk if the user confirms.
@@ -1289,6 +1326,18 @@ class VoiceController:
         from pathlib import Path
         target_clean = target_name.strip().lower().replace("my ", "").replace(" folder", "")
         home = Path.home()
+
+        current_folder = self._current_explorer_folder()
+        if current_folder:
+            current_path = Path(current_folder)
+            if current_path.name.lower() == target_clean:
+                return str(current_path)
+            try:
+                for child in current_path.iterdir():
+                    if child.is_dir() and child.name.lower() == target_clean:
+                        return str(child)
+            except Exception:
+                pass
 
         predefined_roots = [
             home / "Desktop",
@@ -1745,11 +1794,77 @@ class VoiceController:
         except Exception:
             pass
 
+    def _on_foreground_changed(self, hwnd):
+        """Shared by both the event-hook and polling-fallback paths below —
+        kicks off a fresh (generation-guarded) background screen-cache
+        refresh for the newly-foregrounded window."""
+        with self._screen_cache_lock:
+            self._screen_cache_generation += 1
+            gen = self._screen_cache_generation
+        threading.Thread(target=self._refresh_screen_cache, args=(gen,), daemon=True).start()
+
     def _screen_context_loop(self):
-        """Polls the foreground window (a near-free Win32 call, not a UIA walk) and only
-        re-reads the screen when it actually changes — so by the time a command arrives,
-        context is normally already cached instead of being read synchronously after the
-        fact. Same shape as _narration_loop's polling, just unconditional and UIA-backed."""
+        """Event-driven, not polled: registers a native Windows foreground-
+        change hook (SetWinEventHook, EVENT_SYSTEM_FOREGROUND) so the screen
+        cache refreshes the instant focus actually changes, not up to 0.5s
+        later on a polling tick — same category of mechanism NVDA/JAWS use
+        natively (their own AddFocusChangedEventHandler). Deliberately scoped
+        to window-level foreground change only, not full UIA automation
+        events (menu/control-level focus) — that's the one thing this
+        loop's cache is actually keyed on, and the narrower scope avoids the
+        real complexity (apartment-threading, handler lifetime) that a full
+        UIA event subscription would add for no benefit here.
+        Falls back to the old polling loop if the hook can't be installed
+        (e.g. a restricted environment) — the cache must never go silently
+        stale just because this optimization couldn't apply."""
+        import ctypes
+        import ctypes.wintypes as wintypes
+
+        last_hwnd = [None]  # mutable cell, closed over by the ctypes callback
+
+        def _win_event_proc(hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
+            # Must never let a Python exception escape across the ctypes
+            # callback boundary — that corrupts the native call stack instead
+            # of raising a normal, catchable error.
+            try:
+                if hwnd and hwnd != last_hwnd[0]:
+                    last_hwnd[0] = hwnd
+                    self._on_foreground_changed(hwnd)
+            except Exception:
+                pass
+
+        WinEventProcType = ctypes.WINFUNCTYPE(
+            None, wintypes.HANDLE, wintypes.DWORD, wintypes.HWND,
+            wintypes.LONG, wintypes.LONG, wintypes.DWORD, wintypes.DWORD
+        )
+        callback = WinEventProcType(_win_event_proc)
+        user32 = ctypes.windll.user32
+        EVENT_SYSTEM_FOREGROUND = 0x0003
+        WINEVENT_OUTOFCONTEXT = 0x0000
+        hook = user32.SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, 0,
+            callback, 0, 0, WINEVENT_OUTOFCONTEXT
+        )
+        if not hook:
+            self._screen_context_loop_polling_fallback()
+            return
+        try:
+            # SetWinEventHook only delivers callbacks to a thread that's
+            # actively pumping messages — this blocks the dedicated daemon
+            # thread forever in that pump, which is exactly what this loop
+            # is for. `callback` must stay alive for as long as the hook
+            # does; it does, since this frame never returns until the pump
+            # loop below exits.
+            msg = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            user32.UnhookWinEvent(hook)
+
+    def _screen_context_loop_polling_fallback(self):
+        """Original polling implementation — only reached if the native
+        foreground-change hook above couldn't be installed."""
         import win32gui
         last_hwnd = None
         while True:
@@ -1760,10 +1875,7 @@ class VoiceController:
                 continue
             if hwnd and hwnd != last_hwnd:
                 last_hwnd = hwnd
-                with self._screen_cache_lock:
-                    self._screen_cache_generation += 1
-                    gen = self._screen_cache_generation
-                threading.Thread(target=self._refresh_screen_cache, args=(gen,), daemon=True).start()
+                self._on_foreground_changed(hwnd)
 
     def _narration_loop(self):
         import win32gui
