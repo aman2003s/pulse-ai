@@ -72,9 +72,19 @@ class TTSService:
             self.last_active = time.time()
             time.sleep(0.02)
 
+    # Common abbreviations whose period isn't a real sentence end — without this,
+    # "Dr. Smith called" or "e.g. this one" split into a fragment + micro-pause
+    # right after the abbreviation, since a period followed by a space looked
+    # identical to a genuine sentence boundary.
+    _ABBREVIATIONS = ("Mr", "Mrs", "Ms", "Dr", "Prof", "Sr", "Jr", "St", "vs",
+                       "etc", "e.g", "i.e", "approx", "vol", "no", "pg", "ch", "fig")
+    _SENTENCE_SPLIT_RE = re.compile(
+        r"(?<=[.!?])" + "".join(rf"(?<!\b{re.escape(a)}\.)" for a in _ABBREVIATIONS) + r" +"
+    )
+
     def _chunk_text(self, text):
         # Split on sentence boundaries to allow streaming
-        sentences = re.split(r'(?<=[.!?]) +', text)
+        sentences = self._SENTENCE_SPLIT_RE.split(text)
         return [s.strip() for s in sentences if s.strip()]
 
     def _synth_sentence(self, sentence: str) -> np.ndarray:
