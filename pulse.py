@@ -150,6 +150,12 @@ class PulseOrchestrator:
         from core.adapters.win.app_indexer import build_app_index
         threading.Thread(target=build_app_index, daemon=True).start()
 
+        # One-time, idempotent fix for Office's cloud-first Save default (Word/
+        # Excel/PowerPoint all share this setting) — see office_prefs.py. Cheap
+        # registry check, safe to run on every startup, never blocks anything else.
+        from core.adapters.win.office_prefs import disable_office_cloud_default_save
+        disable_office_cloud_default_save()
+
         # DB schema migrations — synchronous and first, since VoiceController's
         # __init__ (constructed below) already reads from the DB.
         from core.db import init_db

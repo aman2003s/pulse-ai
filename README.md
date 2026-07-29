@@ -107,7 +107,7 @@ Full detail — component responsibilities, the command-processing loop, the too
 
 Pulse is Windows-only today.
 
-**Packaged installer**: build one yourself with `cd ui/src-tauri && cargo tauri build` (needs `cargo install tauri-cli --version "^2"` first) — this produces a single `.exe` that installs the full app (UI + backend), no admin rights needed. First launch downloads the model weights (~6GB) automatically; see [`docs/INSTALLER_PLAN.md`](docs/INSTALLER_PLAN.md) for exactly what's verified and what's still rough (no download-progress UI yet, wake-word retraining stays source-only). A prebuilt release isn't published yet — see the repo's [Releases](https://github.com/aman2003s/pulse-ai/releases) page.
+**Packaged installer**: download [`installer/Pulse-Setup-x64.exe`](installer/Pulse-Setup-x64.exe) and run it — one click, no admin rights needed, installs the full app (UI + backend) and runs the backend without popping up a console window. First launch downloads the model weights (~6GB) automatically. To build it yourself instead: `cd ui/src-tauri && cargo tauri build` (needs `cargo install tauri-cli --version "^2"` first) — see [`docs/INSTALLER_PLAN.md`](docs/INSTALLER_PLAN.md) for exactly what's verified and what's still rough (no download-progress UI yet, wake-word retraining stays source-only).
 
 **Run from source** (the tested, complete path today):
 

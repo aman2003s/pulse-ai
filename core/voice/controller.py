@@ -2,6 +2,7 @@ import threading
 import time
 import os
 import sys
+import re
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
@@ -525,23 +526,47 @@ class VoiceController:
     # Round budgets raised 10->24->50 (2026-07-27, second raise per direction:
     # "limit only when one step is repeated many times, not for any other kind
     # of execution"). A numbered ceiling should never be the thing that decides
-    # whether legitimate, varied work gets to finish — only genuine lack of
-    # progress should. That's what stuck detection is for (below): the
-    # ORIGINAL loop-detector catches the exact-repeat case, and a NEW
-    # complementary one (consecutive_no_progress, driven by the "expectation_met"
-    # TVAE field) now catches the case that slipped through it — different
-    # actions each round that still never produce the expected effect (this
-    # exact pattern burned 20+ rounds on Word: never the same action twice,
-    # never real progress either). With THAT as the real stopping signal, this
-    # ceiling goes back to being a pure runaway-safety net, sized so it is
-    # essentially never hit by legitimate work.
+    # whether legitimate, varied work gets to finish. A round-based
+    # "consecutive lack of progress" nudge/park mechanism used to live here too
+    # (added 2026-07-27, removed 2026-07-29 per direction: "only one fail safe
+    # we'll have is 3 times retry") — confirmed live it was the direct cause of
+    # a real restart-loop bug: its own "step back, is there a fundamentally
+    # different way to approach this" wording got misread by the model as
+    # license to restart the whole plan from scratch mid-task. The exact-repeat
+    # loop-detector below and the save-specific 3-retry counter
+    # (save_verify_failures) are now the only bounded safety nets; this round
+    # ceiling is a pure last-resort runaway guard, sized so it is essentially
+    # never hit by legitimate work.
+    # NO decomposition-depth limit on the TOP-LEVEL job length, by explicit
+    # direction — a compound step can decompose into its own sub-steps as many
+    # times as the goal genuinely requires. Depth-limited only as a runaway
+    # safety valve (never by the size of any dynamic content) — same category
+    # and value as _walk_screen_tree's existing depth budget in
+    # system_tools.py, sized for pathological trees, not normal work.
+    MAX_DECOMPOSITION_DEPTH = 40
+
+    # Code-level backstop for task_list reliability — same "check the goal text
+    # directly, don't trust free-text self-report" convention already used by
+    # _save_call_missing_info. Mirrors the prompt's own "BIG MULTI-PART JOBS"
+    # definition (>1 distinct action verb) so the two stay in sync.
+    _COMPOUND_ACTION_VERBS = re.compile(
+        r"\b(open|write|type|save|send|submit|click|search|find|download|install|create|"
+        r"delete|close|move|copy|rename|upload|print|share|export|import|convert|record|"
+        r"attach|reply|forward|schedule|book|order|fill|sign)\b", re.I
+    )
+
+    def _looks_compound(self, goal: str) -> bool:
+        return len(set(m.lower() for m in self._COMPOUND_ACTION_VERBS.findall(goal))) >= 2
+
     def _run_task_loop(self, task_id, goal, system_prompt, max_iterations=50):
         """Plan-and-execute: for a complex multi-part goal the planner first returns a
-        spoken-language `task_list` breakdown; we persist it, narrate progress ("Step 2
-        of 4..."), and run each step through its own act-observe subloop. Single-part
-        goals skip straight to the subloop. This is the standard hierarchical agent
-        pattern (decompose -> execute-with-replanning per step) — it keeps long jobs
-        like "install python" on track without hardcoding any specific workflow."""
+        spoken-language `task_list` breakdown; we persist it and run each step through
+        its own act-observe subloop (see _execute_task_list — that same handling also
+        runs recursively if a STEP itself later turns out to still be compound).
+        Single-part goals skip straight to the subloop. This is the standard
+        hierarchical agent pattern (decompose -> execute-with-replanning per step) —
+        it keeps long jobs like "install python" on track without hardcoding any
+        specific workflow."""
         self._pending_question = False
         response = self.planner.prompt(user_text=goal, system_prompt=system_prompt,
                                          schema=registry.get_planner_schema())
@@ -550,52 +575,90 @@ class VoiceController:
             return []
 
         task_list = [s for s in (response.get("task_list") or []) if s.strip()]
+        if len(task_list) <= 1 and self._looks_compound(goal):
+            # Reasoning-action disconnect (confirmed live 2026-07-29, from a real
+            # trace): the model's own "reasoning" text said "this requires a
+            # task_list" while the actual task_list array came back empty —
+            # task_list is optional in the schema, and free-text reasoning
+            # doesn't constrain fields generated after it. Left uncorrected, the
+            # whole job runs as one continuously-growing _act_observe session
+            # instead of independent steps, which is what task_list exists to
+            # prevent. One corrective retry, the mismatch stated plainly, before
+            # accepting whatever comes back either way — never looped further.
+            retry_response = self.planner.prompt(
+                user_text=(
+                    f"GOAL: {goal}\nThis goal has more than one distinct action and must be broken "
+                    "down. Your previous response didn't include a real task_list array. Return "
+                    "task_list now: one short entry per distinct action, in order."
+                ),
+                system_prompt=system_prompt, schema=registry.get_planner_schema()
+            )
+            if retry_response:
+                response = retry_response
+                task_list = [s for s in (response.get("task_list") or []) if s.strip()]
+
         if len(task_list) > 1:
-            import json as _json
-            conn = get_db()
-            with conn:
-                conn.execute("UPDATE tasks SET plan_json = ?, current_step = 0 WHERE id = ?",
-                             (_json.dumps(task_list), task_id))
-            n = len(task_list)
-            # Don't speak the internal step breakdown ("I'll do this in N steps...",
-            # "Step 2 of 4...") — that's our own decomposition, not something the
-            # user asked to hear. Each sub-goal's own act_observe round already
-            # narrates what it's actually doing via its own "speak" text.
-            all_results = []
-            # Snapshot BEFORE running: if the goal's named file already existed
-            # (a re-save of an existing file), its mere existence can't mean
-            # "goal complete" — only a file that appears DURING this run can.
-            goal_done_at_start = self._goal_file_saved(goal)
-            for i, step_goal in enumerate(task_list):
-                with conn:
-                    conn.execute("UPDATE tasks SET current_step = ? WHERE id = ?", (i, task_id))
-                sub_goal = (f"OVERALL GOAL: {goal}\nCURRENT STEP ({i + 1} of {n}): {step_goal}\n"
-                            f"COMPLETED SO FAR: {task_list[:i]}\nDo only this step now.")
-                results = self._act_observe(task_id, sub_goal, system_prompt, max_rounds=50)
-                all_results.extend(results)
-                # A step's act-observe loop often (legitimately) completes MORE
-                # than its own step — confirmed live: step 1 finished the entire
-                # goal, then steps 2-3 re-ran the already-done work (re-typed,
-                # re-saved) because nothing checked the overall end state. If the
-                # goal's objective end state is now reached, stop here.
-                if not goal_done_at_start and self._goal_file_saved(goal):
-                    return all_results
-                if getattr(self, "_pending_question", False):
-                    # This step parked awaiting an answer — stop here instead of
-                    # marching on to later steps as if it had resolved.
-                    return all_results
-                if any(isinstance(r, dict) and r.get("cancelled") for r in results):
-                    return all_results
-                if results and isinstance(results[-1], dict) and "error" in results[-1]:
-                    if not self.ask_confirmation(
-                            f"Step {i + 1} hit a problem: {str(results[-1]['error'])[:120]}. Should I continue with the remaining steps?"):
-                        self._speak_broadcast("Okay, stopping here.")
-                        return all_results
-            return all_results
+            return self._execute_task_list(task_id, goal, system_prompt, response, depth=0)
 
         # Single-part goal: reuse the response we already have as round one.
         return self._act_observe(task_id, goal, system_prompt,
                                   initial_response=response, max_rounds=max_iterations)
+
+    def _execute_task_list(self, task_id, goal, system_prompt, response, depth=0):
+        """Given a planner response carrying a multi-item task_list, run each entry
+        as its own independent step — its own fresh _act_observe call, with only the
+        short step DESCRIPTIONS (never raw tool results) carried across step
+        boundaries via "COMPLETED SO FAR". This is what keeps each step's own prompt
+        bounded regardless of how much screen-reading an earlier step needed —
+        confirmed live (2026-07-28): without this, "open Word, write X, save it"
+        ran as one continuously-growing session, and Word's own verbose read_screen
+        result (140+ ribbon controls) getting re-sent every round drove one round's
+        prompt from ~1KB to ~55KB within 5 rounds. Called from _run_task_loop for
+        the top-level decomposition, and recursively from _act_observe when a STEP
+        itself turns out to still be compound (the planner proposing its own nested
+        task_list mid-execution, not just on the very first round of the whole job)."""
+        task_list = [s for s in (response.get("task_list") or []) if s.strip()]
+        import json as _json
+        conn = get_db()
+        with conn:
+            conn.execute("UPDATE tasks SET plan_json = ?, current_step = 0 WHERE id = ?",
+                         (_json.dumps(task_list), task_id))
+        n = len(task_list)
+        # Don't speak the internal step breakdown ("I'll do this in N steps...",
+        # "Step 2 of 4...") — that's our own decomposition, not something the
+        # user asked to hear. Each sub-goal's own act_observe round already
+        # narrates what it's actually doing via its own "speak" text.
+        all_results = []
+        # Snapshot BEFORE running: if the goal's named file already existed
+        # (a re-save of an existing file), its mere existence can't mean
+        # "goal complete" — only a file that appears DURING this run can.
+        goal_done_at_start = self._goal_file_saved(goal)
+        for i, step_goal in enumerate(task_list):
+            with conn:
+                conn.execute("UPDATE tasks SET current_step = ? WHERE id = ?", (i, task_id))
+            sub_goal = (f"OVERALL GOAL: {goal}\nCURRENT STEP ({i + 1} of {n}): {step_goal}\n"
+                        f"COMPLETED SO FAR: {task_list[:i]}\nDo only this step now.")
+            results = self._act_observe(task_id, sub_goal, system_prompt, max_rounds=50, _depth=depth)
+            all_results.extend(results)
+            # A step's act-observe loop often (legitimately) completes MORE
+            # than its own step — confirmed live: step 1 finished the entire
+            # goal, then steps 2-3 re-ran the already-done work (re-typed,
+            # re-saved) because nothing checked the overall end state. If the
+            # goal's objective end state is now reached, stop here.
+            if not goal_done_at_start and self._goal_file_saved(goal):
+                return all_results
+            if getattr(self, "_pending_question", False):
+                # This step parked awaiting an answer — stop here instead of
+                # marching on to later steps as if it had resolved.
+                return all_results
+            if any(isinstance(r, dict) and r.get("cancelled") for r in results):
+                return all_results
+            if results and isinstance(results[-1], dict) and "error" in results[-1]:
+                if not self.ask_confirmation(
+                        f"Step {i + 1} hit a problem: {str(results[-1]['error'])[:120]}. Should I continue with the remaining steps?"):
+                    self._speak_broadcast("Okay, stopping here.")
+                    return all_results
+        return all_results
 
     def _verify_saved_file(self, goal: str) -> bool:
         """Objective, code-level check for save/write goals — don't just trust the
@@ -744,7 +807,34 @@ class VoiceController:
             "ctrl+n) before typing anything."
         )
 
-    def _act_observe(self, task_id, goal, system_prompt, initial_response=None, max_rounds=50):
+    def _fold_stale_screen_reads(self, results: list):
+        """In-place: compress every screen-read-shaped result EXCEPT the most recent
+        one down to a short marker, since only the latest is still actionable — the
+        numbered indices click_element/fill_element use always refer to whichever
+        read_screen ran last. Never touches non-screen-read entries (open_app,
+        click/fill results, save_file messages — already compact, never the source
+        of bloat) and never removes anything from the list itself; the "window" key
+        is preserved so _document_identity_gate's window-name lookup keeps working
+        on folded entries too. The full original already reached history_json via
+        append_history at the moment it was first appended — this only changes what
+        gets RE-SERIALIZED into the next prompt, not what's durably stored, so
+        nothing is lost even though nothing is capped by size or count either."""
+        screen_read_indices = [i for i, r in enumerate(results)
+                                if isinstance(r, dict) and ("controls" in r or "visible_text" in r)]
+        if len(screen_read_indices) <= 1:
+            return
+        for i in screen_read_indices[:-1]:
+            r = results[i]
+            if r.get("folded"):
+                continue
+            results[i] = {
+                "folded": True,
+                "window": r.get("window"),
+                "control_count": len(r.get("controls", [])),
+                "note": "superseded by a later read_screen this step — full detail is in this task's saved history",
+            }
+
+    def _act_observe(self, task_id, goal, system_prompt, initial_response=None, max_rounds=50, _depth=0):
         """Reason -> act -> observe -> re-plan loop. Runs whatever the planner proposes,
         feeds it the REAL observed results, asks again until it declares done — because
         a single upfront plan can't know things it hasn't seen yet (element numbers,
@@ -770,17 +860,6 @@ class VoiceController:
         # model to self-report correctly a second time.
         pending_is_defaultable = False
         last_expected_effect = ""  # carried into next round's context, see below
-        # Complementary to the exact-repeat loop-detector above: catches the
-        # case it structurally can't — different actions every round that
-        # still never produce the expected effect (confirmed live: 20+ rounds
-        # on Word, never repeating an action, never actually progressing
-        # either — a round-count ceiling was the only thing that eventually
-        # stopped it). Driven by the "expectation_met" TVAE field, which is
-        # exactly the honest self-report needed for this: a real semantic
-        # progress signal instead of a syntactic repeat check.
-        consecutive_no_progress = 0
-        NO_PROGRESS_HINT_AT = 5
-        NO_PROGRESS_PARK_AT = 9
         save_verify_failures = 0  # escalating counter, see the task_done check below
         for iteration in range(max_rounds):
             if initial_response is not None and iteration == 0:
@@ -792,30 +871,37 @@ class VoiceController:
                 self._speak_broadcast("I'm sorry, I ran into a problem thinking that through.")
                 break
 
-            expectation_met = (response.get("expectation_met") or "").strip().lower()
-            if expectation_met in ("", "yes", "n/a"):
-                consecutive_no_progress = 0
-            else:
-                consecutive_no_progress += 1
-                if consecutive_no_progress == NO_PROGRESS_HINT_AT:
-                    user_text = (
-                        f"GOAL: {goal}\nYou've now gone {NO_PROGRESS_HINT_AT} rounds in a row where your own "
-                        "expectation_met said things weren't working out, even though you tried different "
-                        "things each time — that's still not real progress. Step back: is there a fundamentally "
-                        "different way to approach this (a different tool, a keyboard shortcut instead of "
-                        "hunting for buttons, asking the user something), or is this genuinely blocked? If truly "
-                        "blocked, say so plainly via 'speak' with an empty plan instead of continuing to try "
-                        "variations that keep not working."
-                    )
-                    continue
-                if consecutive_no_progress >= NO_PROGRESS_PARK_AT:
-                    self.tasks.park_task(task_id, "continuation", goal)
-                    self._pending_question = True
-                    self._speak_broadcast(
-                        'I\'ve tried several different ways and none of them are working — say "continue" '
-                        'and I\'ll take another approach, or let me know what\'s actually happening on screen.'
-                    )
-                    break
+            # Recursive decomposition: a step can itself turn out to still be
+            # compound, so recurse into the same handling used at the top level
+            # rather than assuming every step is already atomic. Restricted to
+            # iteration == 0 ONLY — confirmed live (2026-07-28 and again
+            # 2026-07-29): the model can restate its whole mental plan as a fresh
+            # task_list ("1. Open Word 2. Write 3. Save") mid-task, with Word
+            # already open and content already typed. Treating that at face value
+            # mid-execution re-ran open_app from scratch — a real restart loop, not
+            # a genuine decomposition. A task_list only means "this is a fresh,
+            # still-compound (sub-)goal" on the very first round of a call
+            # (matching how the top-level decomposition in _run_task_loop also
+            # only ever fires once, on the first response) — anywhere later it's
+            # the model re-deriving a plan it's already partway through, and must
+            # be treated as ordinary round output instead. Depth-limited only as a
+            # runaway safety valve (MAX_DECOMPOSITION_DEPTH), never by the size of
+            # any dynamic content.
+            nested_task_list = [s for s in (response.get("task_list") or []) if s.strip()]
+            if len(nested_task_list) > 1 and iteration == 0 and _depth < self.MAX_DECOMPOSITION_DEPTH:
+                nested_results = self._execute_task_list(task_id, goal, system_prompt, response, depth=_depth + 1)
+                all_results.extend(nested_results)
+                if getattr(self, "_pending_question", False) or any(
+                        isinstance(r, dict) and r.get("cancelled") for r in nested_results):
+                    return all_results
+                import json as _json_nested
+                user_text = (
+                    f"GOAL: {goal}\nThe nested breakdown above just ran: {nested_task_list}\n"
+                    f"RESULTS: {_json_nested.dumps(nested_results)}\n"
+                    "Continue only if more is genuinely needed for THIS step; otherwise return an "
+                    "empty plan and set task_step_done: true."
+                )
+                continue
 
             speak_text = response.get("speak", "")
             if speak_text and speak_text != self.last_spoken:
@@ -1027,11 +1113,18 @@ class VoiceController:
             # enough later actions piled up — the model concluded the content was
             # NEVER typed and cancelled the save dialog to redo it. Windowing from
             # either end is fragile for a goal whose real length isn't known in
-            # advance. Fix: no windowing or char cap at all — keep the FULL history.
-            # Each entry is already bounded at generation time (read_screen's own
-            # control/text-count limits), so this stays well inside the 32768-token
-            # context for any realistic task; the model needs the complete record
-            # to reliably track what it's actually done, not a guessed-length slice.
+            # advance. Fix: no windowing or char cap at all — keep every entry in
+            # this list, always. What DOES need managing is a different axis
+            # entirely: a verbose read_screen result (Word's ribbon UI alone runs
+            # 140+ controls) sitting at full size forever once a NEWER read of the
+            # same evolving screen exists — confirmed live (2026-07-28) this alone
+            # drove one round's prompt from ~1KB to ~55KB within 5 rounds, on top of
+            # the compound-goal decomposition fix above. _fold_stale_screen_reads
+            # compresses only entries that are demonstrably superseded (nothing is
+            # removed from the list, nothing sized/counted against a limit) — the
+            # full original already reached history_json via append_history the
+            # moment it was first appended, independent of this in-place fold.
+            self._fold_stale_screen_reads(all_results)
             expectation_line = (
                 f"WHAT YOU EXPECTED TO HAPPEN: {last_expected_effect}\n" if last_expected_effect else ""
             )
