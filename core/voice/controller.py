@@ -629,23 +629,27 @@ class VoiceController:
         # user asked to hear. Each sub-goal's own act_observe round already
         # narrates what it's actually doing via its own "speak" text.
         all_results = []
-        # Snapshot BEFORE running: if the goal's named file already existed
-        # (a re-save of an existing file), its mere existence can't mean
-        # "goal complete" — only a file that appears DURING this run can.
-        goal_done_at_start = self._goal_file_saved(goal)
+        # Snapshot BEFORE running — mtime, not just existence: a bare existence
+        # check has a real gap when the goal's named file already existed
+        # before this task started (e.g. re-saving over notes.txt) — existence
+        # alone can never distinguish "already there" from "WE just wrote it",
+        # so the early-exit below could never fire for that case even once the
+        # real save happened. mtime changing is the actual signal.
+        goal_mtime_at_start = self._goal_file_mtime(goal)
         for i, step_goal in enumerate(task_list):
             with conn:
                 conn.execute("UPDATE tasks SET current_step = ? WHERE id = ?", (i, task_id))
             sub_goal = (f"OVERALL GOAL: {goal}\nCURRENT STEP ({i + 1} of {n}): {step_goal}\n"
                         f"COMPLETED SO FAR: {task_list[:i]}\nDo only this step now.")
-            results = self._act_observe(task_id, sub_goal, system_prompt, max_rounds=50, _depth=depth)
+            results = self._act_observe(task_id, sub_goal, system_prompt, max_rounds=50,
+                                         _depth=depth, completed_steps=task_list[:i])
             all_results.extend(results)
             # A step's act-observe loop often (legitimately) completes MORE
             # than its own step — confirmed live: step 1 finished the entire
             # goal, then steps 2-3 re-ran the already-done work (re-typed,
             # re-saved) because nothing checked the overall end state. If the
             # goal's objective end state is now reached, stop here.
-            if not goal_done_at_start and self._goal_file_saved(goal):
+            if self._goal_file_mtime(goal) not in (None, goal_mtime_at_start):
                 return all_results
             if getattr(self, "_pending_question", False):
                 # This step parked awaiting an answer — stop here instead of
@@ -699,22 +703,38 @@ class VoiceController:
                    home / "OneDrive" / "Desktop", home / "OneDrive" / "Documents", home / "OneDrive"]
         return any((f / filename).exists() for f in folders)
 
-    def _goal_file_saved(self, goal: str) -> bool:
-        """STRICT objective completion check: True ONLY when the goal is a save
-        goal naming a specific file AND that file now exists on disk. Unlike
-        _verify_saved_file (whose True also means 'nothing to check'), this never
-        returns True by default — used to SKIP remaining task-list steps once the
-        end state is objectively reached. Confirmed live: step 1's act-observe
-        loop completed the entire goal (file saved + verified), then the outer
-        task-list loop marched into steps 2 and 3 anyway, re-typing and re-saving
-        the already-finished document."""
+    def _goal_file_mtime(self, goal: str):
+        """STRICT objective completion signal: the goal-named file's mtime if
+        the goal is a save goal naming a specific file that currently exists,
+        else None. Used to SKIP remaining task-list steps once the end state
+        is objectively reached — confirmed live: step 1's act-observe loop
+        completed the entire goal (file saved + verified), then the outer
+        task-list loop marched into steps 2 and 3 anyway, re-typing and
+        re-saving the already-finished document. mtime, not bare existence:
+        a file the goal names might already exist BEFORE this task even
+        starts (re-saving over notes.txt) — existence alone can't tell
+        "already there" apart from "just written by this task", so callers
+        must compare the mtime against a snapshot taken before the run
+        started, not just check this for truthiness."""
         import re
         if "save" not in goal.lower():
-            return False
+            return None
         m = re.search(r'\b([\w\-]+\.\w{2,5})\b', goal)
         if not m:
-            return False
-        return self._file_on_disk(m.group(1).strip())
+            return None
+        filename = m.group(1).strip()
+        from pathlib import Path
+        home = Path.home()
+        folders = [home / "Desktop", home / "Documents", home / "Downloads", home,
+                   home / "OneDrive" / "Desktop", home / "OneDrive" / "Documents", home / "OneDrive"]
+        for f in folders:
+            p = f / filename
+            if p.exists():
+                try:
+                    return p.stat().st_mtime
+                except Exception:
+                    return None
+        return None
 
     def _save_call_missing_info(self, goal: str, steps: list) -> str:
         """Purely code-driven backstop for save_file specifically — confirmed
@@ -834,11 +854,16 @@ class VoiceController:
                 "note": "superseded by a later read_screen this step — full detail is in this task's saved history",
             }
 
-    def _act_observe(self, task_id, goal, system_prompt, initial_response=None, max_rounds=50, _depth=0):
+    def _act_observe(self, task_id, goal, system_prompt, initial_response=None, max_rounds=50,
+                      _depth=0, completed_steps=None):
         """Reason -> act -> observe -> re-plan loop. Runs whatever the planner proposes,
         feeds it the REAL observed results, asks again until it declares done — because
         a single upfront plan can't know things it hasn't seen yet (element numbers,
-        found file paths, dialog contents)."""
+        found file paths, dialog contents). `completed_steps`: the short step
+        descriptions already finished ABOVE this call (see _execute_task_list's
+        "COMPLETED SO FAR") — used below to tell a genuine deeper breakdown of
+        THIS step apart from the model just restating the outer plan again."""
+        completed_lower = {s.strip().lower() for s in (completed_steps or [])}
         all_results = []
         user_text = goal
         # Loop detection (confirmed via research: this must happen in code, not
@@ -873,30 +898,37 @@ class VoiceController:
 
             # Recursive decomposition: a step can itself turn out to still be
             # compound, so recurse into the same handling used at the top level
-            # rather than assuming every step is already atomic. Restricted to
-            # iteration == 0 ONLY — confirmed live (2026-07-28 and again
-            # 2026-07-29): the model can restate its whole mental plan as a fresh
-            # task_list ("1. Open Word 2. Write 3. Save") mid-task, with Word
-            # already open and content already typed. Treating that at face value
-            # mid-execution re-ran open_app from scratch — a real restart loop, not
-            # a genuine decomposition. A task_list only means "this is a fresh,
-            # still-compound (sub-)goal" on the very first round of a call
-            # (matching how the top-level decomposition in _run_task_loop also
-            # only ever fires once, on the first response) — anywhere later it's
-            # the model re-deriving a plan it's already partway through, and must
-            # be treated as ordinary round output instead. Depth-limited only as a
-            # runaway safety valve (MAX_DECOMPOSITION_DEPTH), never by the size of
-            # any dynamic content.
+            # rather than assuming every step is already atomic. Subtask depth is
+            # intentionally UNLIMITED (only MAX_DECOMPOSITION_DEPTH guards against
+            # a runaway pathological tree, never a feature limit) — real desktop
+            # workflows can genuinely need several levels ("install python" ->
+            # "download the installer" -> "accept the license" -> ...).
+            #
+            # The real risk isn't depth, it's telling a GENUINE deeper breakdown
+            # of THIS step apart from the model just restating steps that are
+            # already done — confirmed live (2026-07-28/29) two different ways:
+            # restating the whole outer plan on a LATER round mid-step (was
+            # guarded by an `iteration == 0` check), and — a narrower case that
+            # check never covered — restating the outer plan on THIS step's own
+            # very FIRST round, since a fresh sub-step call always starts at
+            # iteration 0 too. Comparing against the real completed_steps list
+            # (not a round counter) catches both: filter out anything that's
+            # just a restatement of what's already finished, and only recurse on
+            # what's left — if that's genuinely more than one new item, it's a
+            # real breakdown of this step; if nothing (or only one item) remains,
+            # it's ordinary round output instead.
             nested_task_list = [s for s in (response.get("task_list") or []) if s.strip()]
-            if len(nested_task_list) > 1 and iteration == 0 and _depth < self.MAX_DECOMPOSITION_DEPTH:
-                nested_results = self._execute_task_list(task_id, goal, system_prompt, response, depth=_depth + 1)
+            genuinely_new = [s for s in nested_task_list if s.strip().lower() not in completed_lower]
+            if len(genuinely_new) > 1 and _depth < self.MAX_DECOMPOSITION_DEPTH:
+                nested_response = dict(response, task_list=genuinely_new)
+                nested_results = self._execute_task_list(task_id, goal, system_prompt, nested_response, depth=_depth + 1)
                 all_results.extend(nested_results)
                 if getattr(self, "_pending_question", False) or any(
                         isinstance(r, dict) and r.get("cancelled") for r in nested_results):
                     return all_results
                 import json as _json_nested
                 user_text = (
-                    f"GOAL: {goal}\nThe nested breakdown above just ran: {nested_task_list}\n"
+                    f"GOAL: {goal}\nThe nested breakdown above just ran: {genuinely_new}\n"
                     f"RESULTS: {_json_nested.dumps(nested_results)}\n"
                     "Continue only if more is genuinely needed for THIS step; otherwise return an "
                     "empty plan and set task_step_done: true."
