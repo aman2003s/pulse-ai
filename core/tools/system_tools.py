@@ -289,8 +289,21 @@ class ReadScreenTool(Tool):
         # richly-populated windows. A 142-item result costs a few thousand
         # tokens against a 32K context budget — cheap next to silently
         # hiding the one control the task actually needed.
-        return {"success": True, "window": top.Name,
-                "controls": items, "visible_text": texts}
+        result = {"success": True, "window": top.Name,
+                  "controls": items, "visible_text": texts}
+        # A window that's genuinely open but exposes almost nothing through UIA
+        # (custom Electron/canvas/WebGL apps, some legacy WPF controls) isn't a
+        # failure to retry — retrying the same tree walk just returns the same
+        # near-empty result again. Point at the vision fallback (look_at_screen)
+        # explicitly rather than letting the model discover that by trial and
+        # error after a few wasted rounds.
+        if len(items) + len(texts) < 3:
+            result["hint"] = (
+                "Very few elements were found through the accessibility tree — this app "
+                "may render its own custom UI. Use look_at_screen to see it visually instead "
+                "of retrying read_screen."
+            )
+        return result
 
 
 class LookAtScreenTool(Tool):
