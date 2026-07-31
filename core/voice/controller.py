@@ -67,6 +67,9 @@ class VoiceController:
         # listening.
         self._typed_reply = None
         self._typed_reply_event = threading.Event()
+        # True for the entire duration of _ask() (speaking the question through
+        # listening for the reply) — see _ask/handle_text_command.
+        self._awaiting_reply = False
 
         # Proactive screen-context cache: refreshed in the background on foreground-window
         # change (see _screen_context_loop), not read live on every command. The read itself
@@ -186,15 +189,18 @@ class VoiceController:
 
     def handle_text_command(self, text: str):
         """Entry point for text commands from the UI (no mic involved). If Pulse
-        is currently listening for a reply (a confirmation, a slot question, a
+        is currently asking for a reply (a confirmation, a slot question, a
         follow-up), typed text answers it directly instead of being dropped —
         the type box does everything voice does here, just skipping the STT
-        step since it's already text."""
-        with self.lock:
-            state = self.state
-        if state == "listening":
+        step since it's already text. Checked via _awaiting_reply, not raw
+        state — state alone is "speaking" during both a genuinely fresh
+        utterance AND the brief re-ask moment inside an active question, and
+        those two cases must be routed differently."""
+        if self._awaiting_reply:
             self.submit_typed_reply(text)
             return
+        with self.lock:
+            state = self.state
         if state not in ("idle", "speaking"):
             return  # busy with a voice session
         if self.tts.is_playing:
@@ -248,6 +254,30 @@ class VoiceController:
             return text, False
         return "", externally_cancelled
 
+    def _ask(self, question: str, no_speech_timeout_s: float = 6.0):
+        """Speaks a question and listens for the reply as one atomic operation —
+        self._awaiting_reply stays True for the WHOLE thing (through the brief
+        "speaking" sub-phase of asking, not just the "listening" sub-phase
+        after), so handle_text_command can correctly route typed input to the
+        answer no matter which sub-phase it arrives in. Confirmed live: a typed
+        reply that arrived during the brief re-ask "speaking" window used to be
+        misrouted as a brand-new top-level command instead of an answer, since
+        the raw state string alone can't distinguish "about to listen for an
+        answer" from "genuinely idle/speaking freely" — both look like
+        "speaking" in the instant before "listening" gets broadcast.
+        Returns (text, was_externally_cancelled) — see _listen_for_reply."""
+        self._awaiting_reply = True
+        try:
+            self.say(question)
+            self.broadcast_state("listening")
+            self.listener.stop()
+            try:
+                return self._listen_for_reply(no_speech_timeout_s=no_speech_timeout_s)
+            finally:
+                self.listener.start()
+        finally:
+            self._awaiting_reply = False
+
     def _is_self_echo(self, text: str) -> bool:
         """Confirmed live (2026-07-31): Pulse's own prior spoken line got picked up
         by its own microphone and fed back in as if it were the user's answer to a
@@ -274,14 +304,7 @@ class VoiceController:
         as if nothing had been said."""
         import re
         for _ in range(2):
-            self.broadcast_state("speaking")
-            self.tts.speak(question)
-            self.broadcast_state("listening")
-            self.listener.stop()
-            try:
-                answer, _ = self._listen_for_reply()
-            finally:
-                self.listener.start()
+            answer, _ = self._ask(question)
             answer = answer.lower()
             if re.search(r"\b(yes|yeah|yep|sure|do it|go ahead|confirm|ok|okay)\b", answer):
                 return True
@@ -301,14 +324,7 @@ class VoiceController:
         decide what that means (announce-and-proceed if default is a real value,
         park the task if default is None). This is what makes "automate everything
         possible" actually hold: a slot question can never hang forever."""
-        self.broadcast_state("speaking")
-        self.tts.speak(question)
-        self.broadcast_state("listening")
-        self.listener.stop()
-        try:
-            answer, _ = self._listen_for_reply(no_speech_timeout_s=timeout_s)
-        finally:
-            self.listener.start()
+        answer, _ = self._ask(question, no_speech_timeout_s=timeout_s)
         answer = answer.strip()
         return answer if answer else default
 
@@ -389,15 +405,11 @@ class VoiceController:
             return
         if _re.search(r"(start|enable|begin|turn on).{0,12}narrat|narrat.{0,8}\bon\b", low):
             self.narrate = True
-            self.broadcast_state("speaking")
-            self.tts.speak("Narration on. I'll announce whenever your focused window changes.")
-            self.broadcast_state("idle")
+            self.say("Narration on. I'll announce whenever your focused window changes.", state_after="idle")
             return
         if _re.search(r"(stop|disable|end|turn off).{0,12}narrat|narrat.{0,8}\boff\b", low):
             self.narrate = False
-            self.broadcast_state("speaking")
-            self.tts.speak("Narration off.")
-            self.broadcast_state("idle")
+            self.say("Narration off.", state_after="idle")
             return
         if _re.search(r"(train|learn|teach).{0,15}(voice|wake)", low):
             self.train_wake_word()
@@ -482,13 +494,7 @@ class VoiceController:
                 # saying it was opening — backwards conversation order).
                 resolved_path = self._resolve_folder(target)
                 if resolved_path:
-                    self.broadcast_state("speaking")  # audio plays now — must stay barge-in interruptible
-                    asyncio.run_coroutine_threadsafe(
-                        self.ws_server.broadcast({"v": 1, "type": "feedback",
-                                                  "text": f"Opening {target}.", "mode": self.feedback_mode}),
-                        self.loop
-                    )
-                    self.tts.speak_hybrid("prefix_opening.wav", f"{target}.")
+                    self.say(f"Opening {target}.", prefix_asset="prefix_opening.wav", dynamic_text=f"{target}.")
                     try:
                         os.startfile(resolved_path)
                         # Confirmed live (2026-07-31): a folder opened this way got
@@ -1163,9 +1169,11 @@ class VoiceController:
                 # "continue") instead of dropping it.
                 self.broadcast_state("listening")
                 self.listener.stop()
+                self._awaiting_reply = True
                 try:
                     answer, _ = self._listen_for_reply(no_speech_timeout_s=6.0)
                 finally:
+                    self._awaiting_reply = False
                     self.listener.start()
                 if answer and self._is_self_echo(answer):
                     print(f"Ignoring likely self-echo as an answer: {answer!r}")
@@ -1400,14 +1408,11 @@ class VoiceController:
         so silence is never the answer: ask what to do HERE, and on no reply read every
         element on the current screen to orient them, then listen once more."""
         superhero = self.feedback_mode == "Guided"
-        self._speak_broadcast("What would you like me to do here?" if superhero else "What would you like me to do now?")
-        self.broadcast_state("listening")
         timeout = 4.0 if superhero else 6.0
-        self.listener.stop()
-        try:
-            text, was_cancelled = self._listen_for_reply(no_speech_timeout_s=timeout)
-        finally:
-            self.listener.start()
+        text, was_cancelled = self._ask(
+            "What would you like me to do here?" if superhero else "What would you like me to do now?",
+            no_speech_timeout_s=timeout
+        )
         if was_cancelled:
             # Explicitly cancelled (not a natural no-speech timeout) — e.g. a new
             # command arrived and interrupted the wait. Go straight to idle, no
@@ -1421,14 +1426,18 @@ class VoiceController:
             text = ""
         if not text and superhero:
             # Orient the user instead of going quiet: full read of the current screen.
-            self._speak_broadcast("No reply — let me tell you what's on your screen right now.")
-            self._read_everything_flow()
-            self.broadcast_state("listening")
-            self.listener.stop()
+            self._awaiting_reply = True
             try:
-                text, was_cancelled = self._listen_for_reply(no_speech_timeout_s=timeout)
+                self._speak_broadcast("No reply — let me tell you what's on your screen right now.")
+                self._read_everything_flow()
+                self.broadcast_state("listening")
+                self.listener.stop()
+                try:
+                    text, was_cancelled = self._listen_for_reply(no_speech_timeout_s=timeout)
+                finally:
+                    self.listener.start()
             finally:
-                self.listener.start()
+                self._awaiting_reply = False
             if was_cancelled:
                 self.broadcast_state("idle")
                 return
@@ -2062,7 +2071,13 @@ class VoiceController:
                 continue
             if title and title != last:
                 if last is not None and self.state == "idle" and not self.tts.is_playing:
+                    # Deliberately NOT migrated to say() — this ambient aside must never
+                    # flip the UI to "speaking" (it stays showing idle throughout, by
+                    # design: an unsolicited narration announcement isn't "Pulse is
+                    # busy"). say() always broadcasts speaking, which would regress
+                    # that here specifically.
                     spoken = title.split(" - ")[-1] if " - " in title else title
+                    self.last_spoken = f"Now in {spoken}."
                     asyncio.run_coroutine_threadsafe(
                         self.ws_server.broadcast({"v": 1, "type": "feedback", "text": f"Now in {spoken}", "mode": self.feedback_mode}),
                         self.loop
@@ -2093,17 +2108,16 @@ class VoiceController:
         row = conn.execute("SELECT value FROM settings WHERE key='onboarded'").fetchone()
         if row:
             return
-        self.broadcast_state("speaking")
-        self.tts.speak("Welcome to Pulse, your voice assistant. Everything runs on your computer and stays private. Let me check your microphone. Please say anything after the beep.")
+        self.say("Welcome to Pulse, your voice assistant. Everything runs on your computer and stays private. Let me check your microphone. Please say anything after the beep.")
         self.capture.play_earcon()
         audio = sd.rec(int(2.5 * 16000), samplerate=16000, channels=1, dtype='int16')
         sd.wait()
         rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
         if rms < 60:
-            self.tts.speak("I couldn't hear you. Your microphone may be muted or too far away. You can still type commands, and we can retry any time.")
+            self.say("I couldn't hear you. Your microphone may be muted or too far away. You can still type commands, and we can retry any time.")
         else:
             w = self.wake_word
-            self.tts.speak(f"Your microphone works. To talk to me, say {w}, wait for the short beep, then speak. Try: {w}, open notepad. To make me recognize you better, say: {w}, train my voice. To hear what's on your screen, say: {w}, what's on my screen. I'm ready.")
+            self.say(f"Your microphone works. To talk to me, say {w}, wait for the short beep, then speak. Try: {w}, open notepad. To make me recognize you better, say: {w}, train my voice. To hear what's on your screen, say: {w}, what's on my screen. I'm ready.")
         with conn:
             conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('onboarded', '1')")
         self.broadcast_state("idle")
@@ -2152,14 +2166,37 @@ class VoiceController:
         finally:
             timer.cancel()
 
-    def _speak_broadcast(self, text):
+    def say(self, text: str, *, prefix_asset: str = None, dynamic_text: str = None, state_after: str = None):
+        """Single gateway for everything Pulse says — every lane funnels through
+        here now, not just the calls that happened to already use
+        _speak_broadcast. Sets last_spoken (needed by the self-echo guard and
+        "what did you just say" replay) and broadcasts the UI feedback text for
+        EVERY speaking call, closing a real gap: ~12 call sites used to call
+        self.tts.speak()/speak_hybrid() directly, bypassing both — those lines
+        could never be caught as self-echo and never showed in the UI's detail
+        line. `text` is always the full sentence for display/last_spoken/self-echo
+        purposes; when `prefix_asset` is given, `dynamic_text` (defaulting to
+        `text` itself) is the part actually sent to synthesis — the prefix WAV
+        already speaks its own words aloud, so e.g. "Opening {target}." is the
+        right thing to show/track even though only "{target}." gets synthesized.
+        state_after is opt-in (None by default, matching the original
+        _speak_broadcast contract exactly) since most callers need to do
+        something else right after speaking, not necessarily go idle."""
         self.last_spoken = text
         self.broadcast_state("speaking")
         asyncio.run_coroutine_threadsafe(
             self.ws_server.broadcast({"v": 1, "type": "feedback", "text": text, "mode": self.feedback_mode}),
             self.loop
         )
-        self.tts.speak(text)
+        if prefix_asset:
+            self.tts.speak_hybrid(prefix_asset, dynamic_text if dynamic_text is not None else text)
+        else:
+            self.tts.speak(text)
+        if state_after is not None:
+            self.broadcast_state(state_after)
+
+    def _speak_broadcast(self, text):
+        self.say(text)
 
     def read_everything(self):
         """A4/A5 continuous screen reading: context -> (ask if Guided) -> tabs -> content.
@@ -2199,7 +2236,7 @@ class VoiceController:
             self.listener.start()
         except Exception as e:
             print(f"Microphone unavailable: {e}")
-            self.tts.speak("I couldn't access a microphone, so voice is off. You can still type commands in the Pulse window.")
+            self.say("I couldn't access a microphone, so voice is off. You can still type commands in the Pulse window.", state_after="idle")
         try:
             self.typing_echo.start()  # hooked but no-op until .enabled is set True
         except Exception as e:
