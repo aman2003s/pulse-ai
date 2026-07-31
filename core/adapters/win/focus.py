@@ -29,6 +29,18 @@ def remember_target(hwnd: int):
     _LAST_TARGET_HWND = hwnd
 
 
+def get_remembered_target():
+    """The last window Pulse intentionally opened/switched to, if it still
+    exists — used for "close it"/"close the app" with no name given, where the
+    real OS foreground window isn't reliable: a TYPED command means the user
+    just clicked into Pulse's own UI, so raw foreground would be Pulse's own
+    window, not the app they mean. Returns None if nothing remembered yet or
+    the window has since closed."""
+    if _LAST_TARGET_HWND and win32gui.IsWindow(_LAST_TARGET_HWND):
+        return _LAST_TARGET_HWND
+    return None
+
+
 def ensure_target_focused():
     """If we have a remembered target window and it's not the one currently in
     focus, force it back to front. Safe to call unconditionally — a no-op if

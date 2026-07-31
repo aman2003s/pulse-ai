@@ -129,13 +129,38 @@ class CloseAppTool(Tool):
             return {"error": "No File Explorer windows are open."}
 
         exe = app_name + ".exe"
-        closed = 0
+        running = {}  # lowercased real process name -> list of psutil.Process
         for proc in psutil.process_iter(['name']):
-            if proc.info['name'] and proc.info['name'].lower() == exe:
+            n = proc.info['name']
+            if n:
+                running.setdefault(n.lower(), []).append(proc)
+
+        # Confirmed live (2026-07-31, "close calculator" failing) and independently
+        # documented (Microsoft's own PowerToys has an open issue about exactly
+        # this): modern UWP apps' real process name routinely doesn't match the
+        # friendly name + ".exe" guess — Calculator runs as CalculatorApp.exe, not
+        # calculator.exe, and which UWP apps get their own named process vs. run
+        # hosted under ApplicationFrameHost.exe varies app to app and Windows
+        # version to version, so no fixed alias table stays correct. Same
+        # rapidfuzz.process.extractOne pattern OpenAppTool already uses for the
+        # equivalent friendly-name-to-real-target problem, applied here against
+        # the REAL running process list instead of the app index (closing only
+        # cares about what's actually running right now). Exact match tried
+        # first — cheap, and guarantees this never behaves differently for a
+        # name that already matches exactly.
+        target_procs = running.get(exe)
+        if not target_procs:
+            match = process.extractOne(app_name, list(running.keys()), scorer=fuzz.QRatio)
+            if match and match[1] >= 60:
+                target_procs = running[match[0]]
+
+        closed = 0
+        if target_procs:
+            for proc in target_procs:
                 try:
                     proc.terminate()
                     closed += 1
-                except:
+                except Exception:
                     pass
 
         if closed > 0:

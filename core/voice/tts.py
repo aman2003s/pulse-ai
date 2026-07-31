@@ -44,6 +44,18 @@ class TTSService:
         print("Loading Kokoro TTS Service...")
         # 'a' for American English
         self.pipeline = KPipeline(lang_code='a')
+        # Confirmed live (2026-07-30, Windows Event Viewer): python.exe crashed with
+        # an access violation (0xc0000005) inside torch_python.dll right after a burst
+        # of multi-sentence replies. Root cause: speak()'s ThreadPoolExecutor lets up
+        # to 3 sentences call into this SAME KPipeline instance concurrently — PyTorch
+        # releases the GIL during real inference, so genuinely concurrent calls into
+        # one stateful pipeline object from multiple threads can race on its internal
+        # buffers. This lock serializes every call into the pipeline (also used by
+        # speak_hybrid's background synth thread) — the first sentence is unaffected
+        # (nothing else holds the lock yet), later ones just queue instead of running
+        # in parallel, which also cuts peak CPU/GPU load from 3x concurrent inference
+        # down to 1x.
+        self._pipeline_lock = threading.Lock()
         self.voice = 'af_heart'
         self.speed = 1.0
         self.cancel_event = threading.Event()
@@ -89,7 +101,8 @@ class TTSService:
 
     def _synth_sentence(self, sentence: str) -> np.ndarray:
         try:
-            chunks = [audio for _, _, audio in self.pipeline(sentence, voice=self.voice, speed=self.speed)]
+            with self._pipeline_lock:
+                chunks = [audio for _, _, audio in self.pipeline(sentence, voice=self.voice, speed=self.speed)]
             if not chunks:
                 return np.zeros(0, dtype=np.float32)
             raw_pcm = np.concatenate(chunks).astype(np.float32)
@@ -176,7 +189,18 @@ class TTSService:
             sd.play(prefix_data, fs_prefix)
             self._wait_for_playback(prefix_data, fs_prefix)
 
-            synth_thread.join(timeout=3.0)
+            # Confirmed live (2026-07-30): under real system load (e.g. a concurrent
+            # LLM call or wake-word training competing for the same GPU/CPU), Kokoro
+            # synthesis of even a short dynamic phrase can exceed 3s — the old fixed
+            # timeout then fell straight to step 3 with dynamic_audio_container still
+            # empty, silently dropping the ENTIRE dynamic half of the sentence (e.g.
+            # "Opening" played, "Desktop" never did) rather than just being briefly
+            # late. 8s gives real headroom over normal synthesis time (well under 1s)
+            # without blocking forever if the pipeline is ever genuinely stuck.
+            synth_thread.join(timeout=8.0)
+            if synth_thread.is_alive():
+                print("speak_hybrid: dynamic synthesis still running after 8s, waiting for it rather than dropping the content")
+                synth_thread.join()
 
             # 3. Play synthesized dynamic text (24kHz)
             if dynamic_audio_container and len(dynamic_audio_container[0]) > 0 and not self.cancel_event.is_set():
@@ -198,8 +222,14 @@ class TTSService:
         self.is_playing = False
 
     def speak_now(self, text, speed=None):
-        """Fire-and-forget single short utterance (typing echo). Does not touch
-        cancel_event/is_playing, so it never fights the main assistant speech."""
+        """Fire-and-forget single short utterance (typing echo, heartbeat filler).
+        Docstring always said this shouldn't fight main assistant speech, but only
+        callers (e.g. _execute_with_heartbeat's timer) ever checked is_playing —
+        never this function itself, leaving a narrow race where real speech could
+        start in the gap between that check and this call. Checked here directly
+        now so every caller gets the guarantee, not just the ones that remember to."""
+        if self.is_playing:
+            return
         try:
             sd.stop()
             pcm = self._synth_sentence(text)

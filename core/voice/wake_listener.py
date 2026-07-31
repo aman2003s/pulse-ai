@@ -58,7 +58,15 @@ class WakeListener:
             window.append(raw_score)
 
             speaking = self.is_speaking_fn()
-            threshold = 0.93 if speaking else 0.3
+            # Idle threshold raised 0.3->0.5 (2026-07-31): openWakeWord's own docs
+            # state 0.5 is the library's recommended default for a single-frame
+            # prediction — Pulse's own sustain check (2-of-4 frames, stricter than
+            # the library's default single-frame check) was still stacked on top
+            # of a threshold notably BELOW that vetted baseline. Not the ~0.9+
+            # "production-tuned" figure from a real noise soak (that still needs
+            # 1.7's dedicated measurement) — this is the library's own tested
+            # default, a safe, evidence-backed step up rather than a guess.
+            threshold = 0.93 if speaking else 0.5
             high_count = sum(1 for s in window if s > threshold)
 
             # TEMPORARY diagnostic — same "watch it live" approach that found the training

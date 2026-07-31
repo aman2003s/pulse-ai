@@ -20,13 +20,18 @@ from core.task_manager import TaskManager
 from core.conversation import ConversationManager
 from core.db import get_db
 from core.voice.typing_echo import TypingEcho
-from core.adapters.win.focus import ensure_target_focused
+from core.adapters.win.focus import ensure_target_focused, find_existing_window, remember_target, get_remembered_target
+import psutil
 import asyncio
 
 class VoiceController:
     def __init__(self, ws_server, planner_port=8081):
         self.tts = TTSService()
-        self.capture = CapturePipeline()
+        # Same is_speaking_fn pattern as WakeListener below (still playing, or
+        # within a brief settle window after) — reused here so the "listen for
+        # a reply" capture never starts while Pulse's own voice could still be
+        # in the room, not just the wake-word detector.
+        self.capture = CapturePipeline(is_speaking_fn=lambda: self.tts.is_playing or (time.time() - self.tts.last_active) < 1.2)
         self.stt = STTService()
         self.planner = PlannerClient(port=planner_port)
         # LookAtScreenTool needs a PlannerClient of its own (vision calls go
@@ -55,6 +60,13 @@ class VoiceController:
         self.narrate = False  # A3: announce focused-window changes
         self.typing_echo = TypingEcho(self.tts)  # opt-in, off by default, skips password fields
         self.last_spoken = ""
+        # Typed-reply channel: lets the UI text box answer whatever voice is
+        # currently listening for (confirmation/slot/follow-up) — see
+        # submit_typed_reply/_listen_for_reply. Typing does everything voice
+        # does here except the STT step, not just a fallback when voice isn't
+        # listening.
+        self._typed_reply = None
+        self._typed_reply_event = threading.Event()
 
         # Proactive screen-context cache: refreshed in the background on foreground-window
         # change (see _screen_context_loop), not read live on every command. The read itself
@@ -173,10 +185,18 @@ class VoiceController:
         self.process_text(text)
 
     def handle_text_command(self, text: str):
-        """Entry point for text commands from the UI (no mic involved)."""
+        """Entry point for text commands from the UI (no mic involved). If Pulse
+        is currently listening for a reply (a confirmation, a slot question, a
+        follow-up), typed text answers it directly instead of being dropped —
+        the type box does everything voice does here, just skipping the STT
+        step since it's already text."""
         with self.lock:
-            if self.state not in ("idle", "speaking"):
-                return  # busy with a voice session
+            state = self.state
+        if state == "listening":
+            self.submit_typed_reply(text)
+            return
+        if state not in ("idle", "speaking"):
+            return  # busy with a voice session
         if self.tts.is_playing:
             self.tts.cancel()
         asyncio.run_coroutine_threadsafe(
@@ -185,8 +205,73 @@ class VoiceController:
         )
         self._safe_thread(self.process_text, text)
 
+    def submit_typed_reply(self, text: str):
+        """Delivers typed text to whichever mic-based wait is currently blocked
+        in _listen_for_reply — see there for how the race is resolved."""
+        self._typed_reply = text
+        self._typed_reply_event.set()
+
+    def _listen_for_reply(self, no_speech_timeout_s: float = 6.0):
+        """Waits for a reply via mic (transcribed) or the UI text box —
+        whichever arrives first. Typing is a first-class way to answer a
+        confirmation/slot question/follow-up, not just a fallback for when
+        voice isn't listening. Caller is expected to have already broadcast
+        'listening' and stopped the wake listener, same as every call site did
+        before this existed.
+
+        Returns (text, was_externally_cancelled) — the second value preserves
+        the ORIGINAL meaning of capture._abort (a genuine external cancel, e.g.
+        a fresh wake-word command interrupting the wait) separately from this
+        method's own internal use of cancel_capture() to stop the losing side
+        of the mic/typed race, which callers must not treat the same way."""
+        self._typed_reply = None
+        self._typed_reply_event.clear()
+        mic_result = {"wav": None}
+
+        def mic_listen():
+            mic_result["wav"] = self.capture.capture_until_silence(no_speech_timeout_s=no_speech_timeout_s)
+            self._typed_reply_event.set()
+
+        t = threading.Thread(target=mic_listen, daemon=True)
+        t.start()
+        self._typed_reply_event.wait(no_speech_timeout_s + 2.0)
+        if self._typed_reply is not None:
+            typed = self._typed_reply
+            self._typed_reply = None
+            self.capture.cancel_capture()
+            t.join(timeout=2.0)
+            return typed, False
+        t.join(timeout=2.0)
+        externally_cancelled = self.capture._abort.is_set()
+        if mic_result["wav"]:
+            text = self.stt.transcribe(mic_result["wav"], extra_vocab=self._vocab_hint()) or ""
+            return text, False
+        return "", externally_cancelled
+
+    def _is_self_echo(self, text: str) -> bool:
+        """Confirmed live (2026-07-31): Pulse's own prior spoken line got picked up
+        by its own microphone and fed back in as if it were the user's answer to a
+        completely unrelated pending question — exact phrase, not a rough guess.
+        CapturePipeline's is_speaking_fn settle-gating is the main fix (never start
+        listening while Pulse is still speaking or within a brief window after);
+        this is a cheap second layer at the point a captured reply gets treated as
+        meaningful, specifically for the exact proven failure mode: a transcribed
+        reply that's essentially Pulse's own last utterance."""
+        if not text or not self.last_spoken:
+            return False
+        from rapidfuzz import fuzz
+        return fuzz.token_set_ratio(text.lower(), self.last_spoken.lower()) >= 85
+
     def ask_confirmation(self, question: str) -> bool:
-        """Speak a question, listen for yes/no. Re-asks once on unclear answer."""
+        """Speak a question, listen for yes/no. Re-asks once on unclear answer.
+        An unclear answer that's substantial enough to be a real, different
+        command (not just noise/mumbling) is never silently discarded — the
+        user's attention has moved on, so it's routed to process_text as its
+        own fresh command instead of being forced through a yes/no classifier
+        it was never an answer to. Confirmed live: "open outlook" spoken in
+        reply to an unrelated yes/no prompt matched neither regex and used to
+        just vanish after the retry, with the original stale intent proceeding
+        as if nothing had been said."""
         import re
         for _ in range(2):
             self.broadcast_state("speaking")
@@ -194,13 +279,17 @@ class VoiceController:
             self.broadcast_state("listening")
             self.listener.stop()
             try:
-                wav = self.capture.capture_until_silence()
+                answer, _ = self._listen_for_reply()
             finally:
                 self.listener.start()
-            answer = (self.stt.transcribe(wav) or "").lower() if wav else ""
+            answer = answer.lower()
             if re.search(r"\b(yes|yeah|yep|sure|do it|go ahead|confirm|ok|okay)\b", answer):
                 return True
             if re.search(r"\b(no|nope|stop|cancel|don't|abort)\b", answer):
+                return False
+            if len(answer.split()) >= 2:
+                print(f"ask_confirmation: unrelated command detected mid-question, rerouting: {answer!r}")
+                self._safe_thread(self.process_text, answer)
                 return False
             question = "Sorry, I didn't catch that. Please say yes or no."
         return False
@@ -217,12 +306,10 @@ class VoiceController:
         self.broadcast_state("listening")
         self.listener.stop()
         try:
-            wav = self.capture.capture_until_silence(no_speech_timeout_s=timeout_s)
+            answer, _ = self._listen_for_reply(no_speech_timeout_s=timeout_s)
         finally:
             self.listener.start()
-        if not wav:
-            return default
-        answer = (self.stt.transcribe(wav, extra_vocab=self._vocab_hint()) or "").strip()
+        answer = answer.strip()
         return answer if answer else default
 
     _STATIC_FOLDERS = ("desktop", "documents", "downloads", "pictures", "music", "videos")
@@ -274,9 +361,10 @@ class VoiceController:
             # unindexed name — the AI lane's screen-context + search_file + ask
             # flow is what's actually suited to resolving it.
 
-        m = _re.match(r"^(?:close|quit)\s+(?:my\s+|the\s+)?(.+)$", norm_text)
+        m = _re.match(r"^(?:close|quit)(?:\s+(?:my\s+|the\s+)?(.+))?$", norm_text)
         if m:
-            return ("close_app", m.group(1).strip())
+            target = (m.group(1) or "").strip()
+            return ("close_app", target or "__focused__")
 
         return None
 
@@ -403,6 +491,29 @@ class VoiceController:
                     self.tts.speak_hybrid("prefix_opening.wav", f"{target}.")
                     try:
                         os.startfile(resolved_path)
+                        # Confirmed live (2026-07-31): a folder opened this way got
+                        # NONE of open_app's foregrounding help — Windows blocks
+                        # background processes from stealing focus by default (see
+                        # focus.py's own module docstring), and nothing here ever
+                        # counteracted that for folders, unlike open_app. Verified:
+                        # foreground stayed on the calling app, the new Explorer
+                        # window landed behind it with nothing bringing it forward
+                        # — exactly the "opens minimized/in background" reports.
+                        # explorer.exe shares one process across every window it
+                        # owns, so we can't match by process-start-time the way
+                        # open_app does for a real per-launch process; poll briefly
+                        # for a window titled after the target folder instead, then
+                        # force it forward the same way open_app already does.
+                        deadline = time.time() + 4.0
+                        hwnd = None
+                        while time.time() < deadline:
+                            hwnd = find_existing_window(target)
+                            if hwnd:
+                                break
+                            time.sleep(0.15)
+                        if hwnd:
+                            remember_target(hwnd)
+                            ensure_target_focused()
                     except Exception as e:
                         print(f"Error opening folder {resolved_path}: {e}")
                         self._speak_broadcast(f"I found {target}, but couldn't open it.")
@@ -412,6 +523,28 @@ class VoiceController:
                 # through silently to the AI planner below, which can search/ask.
 
             elif kind == "close_app":
+                if target == "__focused__":
+                    # "close" with no name given -> the app currently in use. NOT raw
+                    # OS foreground: a TYPED command means the user just clicked into
+                    # Pulse's own UI to type, so real foreground would be Pulse's own
+                    # window, not the app they mean. remember_target() already tracks
+                    # "the last app Pulse intentionally opened/switched to" for this
+                    # exact reason (see focus.py) — falls back to raw OS foreground
+                    # only if nothing's been remembered yet (a voice-only session
+                    # where foreground is already reliably the right window).
+                    import win32gui, win32process
+                    hwnd = get_remembered_target() or win32gui.GetForegroundWindow()
+                    target = ""
+                    try:
+                        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                        proc_name = psutil.Process(pid).name()
+                        target = proc_name[:-4] if proc_name.lower().endswith(".exe") else proc_name
+                    except Exception as e:
+                        print(f"Couldn't resolve focused app to close: {e}")
+                    if not target:
+                        self._speak_broadcast("I couldn't tell what's currently open to close.")
+                        self.broadcast_state("idle")
+                        return
                 # Routed through the SAME ToolExecutor path as everything else, so the
                 # confirm gate actually applies — close_app is permission_level="confirm"
                 # by design; calling tool.execute() directly here used to skip that
@@ -1031,10 +1164,12 @@ class VoiceController:
                 self.broadcast_state("listening")
                 self.listener.stop()
                 try:
-                    wav = self.capture.capture_until_silence(no_speech_timeout_s=6.0)
+                    answer, _ = self._listen_for_reply(no_speech_timeout_s=6.0)
                 finally:
                     self.listener.start()
-                answer = self.stt.transcribe(wav, extra_vocab=self._vocab_hint()) if wav else ""
+                if answer and self._is_self_echo(answer):
+                    print(f"Ignoring likely self-echo as an answer: {answer!r}")
+                    answer = ""
                 if answer:
                     asyncio.run_coroutine_threadsafe(
                         self.ws_server.broadcast({"v": 1, "type": "transcript", "payload": answer}),
@@ -1270,10 +1405,10 @@ class VoiceController:
         timeout = 4.0 if superhero else 6.0
         self.listener.stop()
         try:
-            wav = self.capture.capture_until_silence(no_speech_timeout_s=timeout)
+            text, was_cancelled = self._listen_for_reply(no_speech_timeout_s=timeout)
         finally:
             self.listener.start()
-        if self.capture._abort.is_set():
+        if was_cancelled:
             # Explicitly cancelled (not a natural no-speech timeout) — e.g. a new
             # command arrived and interrupted the wait. Go straight to idle, no
             # "I didn't hear you" / screen-read fallback speech. Found via real testing:
@@ -1281,7 +1416,9 @@ class VoiceController:
             # kept the app busy, causing the next command to arrive mid-flow.
             self.broadcast_state("idle")
             return
-        text = self.stt.transcribe(wav, extra_vocab=self._vocab_hint()) if wav else ""
+        if text and self._is_self_echo(text):
+            print(f"Ignoring likely self-echo in follow-up: {text!r}")
+            text = ""
         if not text and superhero:
             # Orient the user instead of going quiet: full read of the current screen.
             self._speak_broadcast("No reply — let me tell you what's on your screen right now.")
@@ -1289,13 +1426,15 @@ class VoiceController:
             self.broadcast_state("listening")
             self.listener.stop()
             try:
-                wav = self.capture.capture_until_silence(no_speech_timeout_s=timeout)
+                text, was_cancelled = self._listen_for_reply(no_speech_timeout_s=timeout)
             finally:
                 self.listener.start()
-            if self.capture._abort.is_set():
+            if was_cancelled:
                 self.broadcast_state("idle")
                 return
-            text = self.stt.transcribe(wav, extra_vocab=self._vocab_hint()) if wav else ""
+            if text and self._is_self_echo(text):
+                print(f"Ignoring likely self-echo in follow-up: {text!r}")
+                text = ""
         if text:
             asyncio.run_coroutine_threadsafe(
                 self.ws_server.broadcast({"v": 1, "type": "transcript", "payload": text}),
