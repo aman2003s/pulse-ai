@@ -20,6 +20,12 @@ GEMMA_TARGET = os.path.join(MODELS_DIR, "gemma-4-E4B-it-Q4_K_M.gguf")
 # will fail without --mmproj pointed at this file.
 MMPROJ_URL = "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/mmproj-F16.gguf"
 MMPROJ_TARGET = os.path.join(MODELS_DIR, "mmproj.gguf")
+# MTP (Multi-Token Prediction) drafter — small (~99MB), speeds up generation via
+# speculative decoding when paired with -fa (see pulse.py's start_llama for why
+# both together, not just this alone). Optional: pulse.py already degrades
+# gracefully (a warning, no speculative decoding) if this file is missing.
+MTP_URL = "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/mtp-gemma-4-E4B-it.gguf"
+MTP_TARGET = os.path.join(MODELS_DIR, "mtp-gemma-4-E4B-it.gguf")
 
 def _download_with_progress(url, target_path, label):
     print(f"Downloading {label} from {url}...")
@@ -53,6 +59,13 @@ def setup_mmproj():
         return
     os.makedirs(MODELS_DIR, exist_ok=True)
     _download_with_progress(MMPROJ_URL, MMPROJ_TARGET, "vision projector (~950MB)")
+
+def setup_mtp():
+    if os.path.exists(MTP_TARGET):
+        print(f"MTP drafter already exists at {MTP_TARGET}")
+        return
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    _download_with_progress(MTP_URL, MTP_TARGET, "MTP drafter (~99MB)")
 
 def fetch_llama_server():
     server_path = os.path.join(MODELS_DIR, "llama-server.exe")
