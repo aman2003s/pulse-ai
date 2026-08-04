@@ -16,6 +16,7 @@ class WakeListener:
         self.is_running = False
         self.stream = None
         self.owwModel = None
+        self._last_callback_time = None
         self.model_path = os.path.join(models_dir(), f'{model_name}.onnx')
         # AEC-lite: we have no real echo cancellation, so Pulse's own TTS can bleed into
         # the mic and false-trigger the wake word. Require much higher confidence while
@@ -24,6 +25,7 @@ class WakeListener:
         self.is_speaking_fn = is_speaking_fn or (lambda: False)
         
     def _audio_callback(self, indata, frames, time_info, status):
+        self._last_callback_time = time.time()
         if not self.is_running:
             return
         try:
@@ -39,35 +41,35 @@ class WakeListener:
                     raw_score = val
                     break
 
-            # Sustain check: require at least 2 of the last 4 raw 80ms frames (~320ms) to
-            # clear threshold, in BOTH idle and speaking states — not any single frame in
-            # isolation. A genuine "Pulse" naturally spans several consecutive high-confidence
-            # frames, so this still tolerates one momentary mid-word dip. This replaces an
-            # older max()-over-window ("smoothed score") approach that had two real bugs:
-            # (1) idle state had no sustain check at all — one noisy ambient frame crossing
-            # 0.3 triggered instantly; (2) the speaking-mode anti-echo guard counted the
-            # max-of-window score rather than raw per-frame scores, so a single spike stayed
-            # "high" for 2 extra frames after the fact and could satisfy the "2 consecutive
-            # frames" requirement on its own — defeating the guard it was meant to enforce.
-            # Counting raw threshold-crossings within a short rolling window instead requires
-            # genuinely independent high-confidence frames in both states.
-            window = getattr(self, '_score_window', None)
-            if window is None:
-                from collections import deque
-                window = self._score_window = deque(maxlen=4)
-            window.append(raw_score)
-
+            # Sustain check: require 3 TRULY CONSECUTIVE raw 80ms frames (~240ms) above
+            # threshold, not just "2 hits somewhere in the last 4 frames" (the previous
+            # rule, which didn't actually require adjacency). Tightened 2026-08-01 after a
+            # real user-reported false-accept ("waking up again and again" from video
+            # audio containing no wake word) was measured, not guessed: replaying ordinary
+            # non-wake-word speech through this exact model found a genuine isolated
+            # single-frame spike (raw=0.905) that the OLD "any 2 of last 4" rule would NOT
+            # have caught either (it never got a second hit in that window) — but a
+            # position-agnostic rule leaves real exposure for two separate near-threshold
+            # moments landing in the same short window by chance on louder/longer real-world
+            # audio (a full video has far more raw exposure than any offline test can
+            # cover). Measured real "Pulse" utterances for comparison: a clean 4-frame
+            # consecutive run (scores ~1.00/0.93/0.99/1.00) — comfortably clears a
+            # true-consecutive requirement of 3, so this can only ever reduce false accepts,
+            # never cost a real detection under measured conditions. Same rule, same
+            # threshold values, in both idle and speaking states.
             speaking = self.is_speaking_fn()
             # Idle threshold raised 0.3->0.5 (2026-07-31): openWakeWord's own docs
             # state 0.5 is the library's recommended default for a single-frame
-            # prediction — Pulse's own sustain check (2-of-4 frames, stricter than
-            # the library's default single-frame check) was still stacked on top
-            # of a threshold notably BELOW that vetted baseline. Not the ~0.9+
-            # "production-tuned" figure from a real noise soak (that still needs
-            # 1.7's dedicated measurement) — this is the library's own tested
-            # default, a safe, evidence-backed step up rather than a guess.
+            # prediction — Pulse's own sustain check (stricter than the library's
+            # default single-frame check) was still stacked on top of a threshold
+            # notably BELOW that vetted baseline. Not the ~0.9+ "production-tuned"
+            # figure from a real noise soak (that still needs 1.7's dedicated
+            # measurement) — this is the library's own tested default, a safe,
+            # evidence-backed step up rather than a guess.
             threshold = 0.93 if speaking else 0.5
-            high_count = sum(1 for s in window if s > threshold)
+            consecutive = getattr(self, '_consecutive_high', 0)
+            consecutive = consecutive + 1 if raw_score > threshold else 0
+            self._consecutive_high = consecutive
 
             # TEMPORARY diagnostic — same "watch it live" approach that found the training
             # bugs. Reusing this SAME callback/stream (not a second parallel InputStream,
@@ -80,14 +82,14 @@ class WakeListener:
                 self._last_heartbeat = now_hb
                 print(f"[mic heartbeat] rms={rms:.1f}")
             if raw_score > 0.05 or rms > 300:
-                print(f"[wake score] raw={raw_score:.3f} high_count={high_count}/{len(window)} "
+                print(f"[wake score] raw={raw_score:.3f} consecutive={consecutive}/3 "
                       f"threshold={threshold:.2f} speaking={speaking} rms={rms:.1f}")
 
-            if high_count >= 2:
+            if consecutive >= 3:
                 now = time.time()
                 if now - getattr(self, '_last_trigger', 0) > 2.0:  # debounce
                     self._last_trigger = now
-                    window.clear()
+                    self._consecutive_high = 0
                     self.callback()
         except Exception as e:
             # Never crash the audio thread on a bad frame, but don't go fully silent

@@ -6,12 +6,15 @@ import threading
 import time
 import re
 import os
+import logging
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 
 from core.paths import models_dir
+from core.utils.timing import log_elapsed
 
 warnings.filterwarnings("ignore")
+logger = logging.getLogger(__name__)
 
 def pad_silence(pcm: np.ndarray, samplerate: int, pad_s: float = 0.25) -> np.ndarray:
     """Appends real trailing silence so any playback-end timing imprecision
@@ -42,6 +45,37 @@ def trim_silence(pcm: np.ndarray, threshold: float = 0.01) -> np.ndarray:
 class TTSService:
     def __init__(self):
         print("Loading Kokoro TTS Service...")
+        # Real crash traced here via direct minidump analysis (2026-08-01, not
+        # guessed): a python.exe access violation / heap corruption with the
+        # crashing thread's stack running through torch_cpu.dll and c10.dll
+        # during synthesis. This is a known class of PyTorch CPU intra-op
+        # threading crash, especially on hybrid P/E-core CPUs (11th-gen+ Intel —
+        # exactly this project's own stated target hardware profile) where
+        # MKL/OMP's default thread pool can hit real native races.
+        #
+        # A pool of independent KPipeline instances (real parallelism, no shared
+        # mutable state) was considered and rejected: measured at ~650-700MB RAM
+        # PER INSTANCE, which is unacceptable on the 16GB low-end target hardware
+        # this whole project is built around, already running an LLM/STT/VAD
+        # stack. Single-threading (num_threads=1) was also tried and rejected —
+        # ~3x slower per sentence (523ms->1626ms measured), too costly given
+        # synthesis speed is a separate, already-flagged concern.
+        # Landed on a middle ground instead, at ZERO extra memory cost: reduce
+        # (not eliminate) intra-op thread count. Measured on this machine:
+        # 16 threads (default) 523ms, 4 threads 610ms, 2 threads 1026ms, 1
+        # thread 1626ms per short sentence. 4 threads costs only ~17% vs
+        # unrestricted while meaningfully cutting how many threads OMP/MKL
+        # juggles internally per call. Global setting (not scoped to just this
+        # pipeline) — set here since TTSService constructs before
+        # CapturePipeline's own torch-based Silero VAD model, so it applies to
+        # both. Honest caveat: this reduces exposure to the crash class, it does
+        # NOT prove the crash can't still happen — the underlying race is
+        # intermittent and wasn't reproduced on demand, so no thread count could
+        # be verified as fully safe short of a long soak test.
+        import torch
+        # Reverted to unrestricted per direction — crash mitigation is secondary
+        # to actually root-causing the behavioral bug; deliberately keeping the
+        # fastest, most crash-exposed config while that's investigated for real.
         # 'a' for American English
         self.pipeline = KPipeline(lang_code='a')
         # Confirmed live (2026-07-30, Windows Event Viewer): python.exe crashed with
@@ -59,9 +93,32 @@ class TTSService:
         self.voice = 'af_heart'
         self.speed = 1.0
         self.cancel_event = threading.Event()
+        # Real concurrency bug found 2026-08-01 (user-reported: overlapping/garbled
+        # speech, "2-3 flows running in parallel"): cancel_event is a single shared
+        # flag, and every speak()/speak_hybrid() call starts by clearing it. If an
+        # OLDER call's background thread is still unwinding (hasn't yet reached its
+        # next cancel_event check) when a NEWER call starts — e.g. a wake-word
+        # misfire triggers tts.cancel() for barge-in, then a new response starts
+        # speaking within that same brief window — the new call's .clear() erases
+        # the cancellation the old call was still acting on, letting it resume
+        # playing concurrently with the new one. A generation counter closes this:
+        # every speak-family call captures its own generation number and treats
+        # "someone newer has started" as an equally valid stop signal, independent
+        # of whatever the shared cancel_event happens to read at that moment.
+        self._speak_generation = 0
+        self._generation_lock = threading.Lock()
         self.is_playing = False
         self.last_active = 0.0  # for AEC-lite: audio can still be resonating briefly after playback ends
         self.assets_dir = os.path.join(models_dir(), 'assets')
+        # Measured (2026-08-01): the FIRST real synthesis call after model load takes
+        # ~600-700ms longer than steady-state (~1.4s vs ~0.7-0.8s for a short sentence)
+        # — a one-time PyTorch/threading warm-up tax, not a per-call cost. Without this,
+        # that tax landed on the very first thing Pulse ever says (the startup greeting,
+        # 6.1) — the worst possible place for it, since it's the user's first impression
+        # of response speed. Absorbing it here instead runs it during boot, which already
+        # takes several seconds for llama-server + model loads regardless.
+        with log_elapsed(logger, "tts.warmup"):
+            self._synth_sentence("Ready.")
 
     # Researched (2026-07-27): sd.wait()/blocking=True is a KNOWN Windows bug —
     # python-sounddevice issue #283 confirms it cuts playback off slightly
@@ -75,14 +132,26 @@ class TTSService:
     # source instead of guessed at here — see _pad_silence — every buffer
     # this waits on already has real trailing silence baked in, so an
     # early-by-a-few-hundred-ms cutoff can only ever eat silence.
-    def _wait_for_playback(self, audio, samplerate):
+    def _wait_for_playback(self, audio, samplerate, generation=None):
         deadline = time.time() + len(audio) / samplerate
         while time.time() < deadline:
-            if self.cancel_event.is_set():
+            if self._is_stale(generation):
                 sd.stop()
                 return
             self.last_active = time.time()
             time.sleep(0.02)
+
+    def _new_generation(self) -> int:
+        """Claims the next speak-family generation number — see __init__'s
+        _speak_generation comment. Every speak()/speak_hybrid()/speak_now() call
+        gets its own number and treats a newer one appearing as a stop signal,
+        independent of cancel_event's current value."""
+        with self._generation_lock:
+            self._speak_generation += 1
+            return self._speak_generation
+
+    def _is_stale(self, generation) -> bool:
+        return self.cancel_event.is_set() or (generation is not None and generation != self._speak_generation)
 
     # Common abbreviations whose period isn't a real sentence end — without this,
     # "Dr. Smith called" or "e.g. this one" split into a fragment + micro-pause
@@ -101,12 +170,13 @@ class TTSService:
 
     def _synth_sentence(self, sentence: str) -> np.ndarray:
         try:
-            with self._pipeline_lock:
-                chunks = [audio for _, _, audio in self.pipeline(sentence, voice=self.voice, speed=self.speed)]
-            if not chunks:
-                return np.zeros(0, dtype=np.float32)
-            raw_pcm = np.concatenate(chunks).astype(np.float32)
-            return pad_silence(trim_silence(raw_pcm), 24000)
+            with log_elapsed(logger, f"tts.synthesis[{sentence[:30]!r}]"):
+                with self._pipeline_lock:
+                    chunks = [audio for _, _, audio in self.pipeline(sentence, voice=self.voice, speed=self.speed)]
+                if not chunks:
+                    return np.zeros(0, dtype=np.float32)
+                raw_pcm = np.concatenate(chunks).astype(np.float32)
+                return pad_silence(trim_silence(raw_pcm), 24000)
         except Exception as e:
             print(f"Sentence synth error ('{sentence}'): {e}")
             return np.zeros(0, dtype=np.float32)
@@ -116,6 +186,7 @@ class TTSService:
         so Sentence 2 & 3 synthesize in background while Sentence 1 starts playing instantly.
         Interruptible via self.cancel_event."""
         import queue
+        my_generation = self._new_generation()
         self.cancel_event.clear()
         self.is_playing = True
         sentences = self._chunk_text(text)
@@ -131,14 +202,14 @@ class TTSService:
                     with ThreadPoolExecutor(max_workers=min(len(sentences), 3)) as executor:
                         futures = [executor.submit(self._synth_sentence, s) for s in sentences]
                         for f in futures:
-                            if self.cancel_event.is_set():
+                            if self._is_stale(my_generation):
                                 break
                             audio = f.result()
                             if len(audio) > 0:
                                 q.put(audio)
                 else:
                     audio = self._synth_sentence(sentences[0])
-                    if len(audio) > 0 and not self.cancel_event.is_set():
+                    if len(audio) > 0 and not self._is_stale(my_generation):
                         q.put(audio)
             except Exception as e:
                 print(f"TTS generation error: {e}")
@@ -147,22 +218,25 @@ class TTSService:
 
         threading.Thread(target=producer, daemon=True).start()
         try:
-            while not self.cancel_event.is_set():
+            while not self._is_stale(my_generation):
                 audio = q.get()
                 if audio is None:
                     break
-                sd.play(audio, 24000)
-                self._wait_for_playback(audio, 24000)
+                with log_elapsed(logger, "tts.playback"):
+                    sd.play(audio, 24000)
+                    self._wait_for_playback(audio, 24000, generation=my_generation)
         except Exception as e:
             print(f"TTS Error: {e}")
         finally:
-            self.is_playing = False
+            if my_generation == self._speak_generation:
+                self.is_playing = False
             self.last_active = time.time()
             sd.stop()
 
     def speak_hybrid(self, prefix_asset_name: str, dynamic_text: str):
         """Instant playback: plays pre-baked static audio prefix from models/assets/ in 0ms,
         while dynamic_text generates in parallel and crossfades seamlessly into PCM playback."""
+        my_generation = self._new_generation()
         self.cancel_event.clear()
         self.is_playing = True
 
@@ -187,7 +261,7 @@ class TTSService:
 
             # 2. Play pre-baked prefix instantly (16kHz)
             sd.play(prefix_data, fs_prefix)
-            self._wait_for_playback(prefix_data, fs_prefix)
+            self._wait_for_playback(prefix_data, fs_prefix, generation=my_generation)
 
             # Confirmed live (2026-07-30): under real system load (e.g. a concurrent
             # LLM call or wake-word training competing for the same GPU/CPU), Kokoro
@@ -203,14 +277,15 @@ class TTSService:
                 synth_thread.join()
 
             # 3. Play synthesized dynamic text (24kHz)
-            if dynamic_audio_container and len(dynamic_audio_container[0]) > 0 and not self.cancel_event.is_set():
+            if dynamic_audio_container and len(dynamic_audio_container[0]) > 0 and not self._is_stale(my_generation):
                 dyn_pcm = dynamic_audio_container[0]
                 sd.play(dyn_pcm, 24000)
-                self._wait_for_playback(dyn_pcm, 24000)
+                self._wait_for_playback(dyn_pcm, 24000, generation=my_generation)
         except Exception as e:
             print(f"speak_hybrid error: {e}")
         finally:
-            self.is_playing = False
+            if my_generation == self._speak_generation:
+                self.is_playing = False
             self.last_active = time.time()
             sd.stop()
 
@@ -230,11 +305,12 @@ class TTSService:
         now so every caller gets the guarantee, not just the ones that remember to."""
         if self.is_playing:
             return
+        my_generation = self._new_generation()
         try:
             sd.stop()
             pcm = self._synth_sentence(text)
-            if len(pcm) > 0:
+            if len(pcm) > 0 and not self._is_stale(my_generation):
                 sd.play(pcm, 24000)
-                self._wait_for_playback(pcm, 24000)
+                self._wait_for_playback(pcm, 24000, generation=my_generation)
         except Exception as e:
             print(f"speak_now error: {e}")

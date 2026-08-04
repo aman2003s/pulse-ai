@@ -3,6 +3,11 @@ import time
 import os
 import sys
 import re
+import logging
+
+from core.utils.timing import log_elapsed
+
+logger = logging.getLogger(__name__)
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
@@ -16,6 +21,7 @@ from core.executor.executor import ToolExecutor
 from core.tools.registry import registry
 import core.tools.win_tools  # noqa: F401 — registers tools
 import core.tools.system_tools as system_tools  # registers tools; also used for set_planner_port below
+import core.tools.pdf_tools  # noqa: F401 — registers tools
 from core.task_manager import TaskManager
 from core.conversation import ConversationManager
 from core.db import get_db
@@ -49,7 +55,19 @@ class VoiceController:
         
         self.listener = WakeListener(
             self.on_wake_word_detected,
-            is_speaking_fn=lambda: self.tts.is_playing or (time.time() - self.tts.last_active) < 1.2
+            # Widened beyond literal "is speaking" (2026-08-01, real user-reported
+            # regression): a wake-word misfire during "thinking"/"acting" triggers
+            # the SAME park-on-interrupt path as a genuine barge-in (4.4), silently
+            # cutting off correct in-progress work — just as disruptive as a misfire
+            # cutting off actual speech, but was still using the lenient 0.5 idle
+            # threshold instead of the 0.93 speaking one. Standard industry practice
+            # (Alexa/Google-style) is to require a stricter confidence bar specifically
+            # at any point where a false accept would interrupt something, accepting a
+            # slightly higher false-reject rate there in exchange — a missed wake
+            # attempt just means saying it again, but a misfire silently corrupting
+            # active work is a much worse user experience.
+            is_speaking_fn=lambda: (self.tts.is_playing or (time.time() - self.tts.last_active) < 1.2
+                                     or self.state in ("thinking", "acting"))
         )
         self.state = "idle"
         self.lock = threading.Lock()
@@ -70,6 +88,19 @@ class VoiceController:
         # True for the entire duration of _ask() (speaking the question through
         # listening for the reply) — see _ask/handle_text_command.
         self._awaiting_reply = False
+        # Park-on-interrupt (4.4): set by on_wake_word_detected when the wake
+        # word fires WHILE a task is actively thinking/acting (not waiting on
+        # a reply — that's already handled by _awaiting_reply/_listen_for_reply).
+        # Checked only at safe points BETWEEN planner rounds in _act_observe's
+        # loop, never mid-tool-call — this is why it's a cooperative flag, not
+        # a hard cancel: Python threads can't be killed safely, and the prior
+        # design here (silently ignoring the wake word during an active task)
+        # existed specifically to avoid a confirmed real bug where barging in
+        # mid-task started a second overlapping session racing the first. This
+        # flag lets a genuine interrupt park the running task's real progress
+        # instead of either corrupting it OR silently dropping the user's new
+        # command on the floor.
+        self._interrupt_requested = threading.Event()
 
         # Proactive screen-context cache: refreshed in the background on foreground-window
         # change (see _screen_context_loop), not read live on every command. The read itself
@@ -112,12 +143,45 @@ class VoiceController:
 
     def on_wake_word_detected(self):
         with self.lock:
-            if self.state in ("listening", "thinking", "acting"):
-                # A task is actively running — barging in here would start a second
-                # overlapping session racing the first (found via real testing: this
-                # corrupted a multi-step task when ambient noise self-triggered the
-                # wake word mid-execution). Only "speaking" is interruptible (barge-in
-                # over Pulse's own voice) and "idle" starts fresh.
+            if self.state == "listening":
+                # Mic already in use for a pending reply (_ask/_listen_for_reply)
+                # — starting a second capture session here would race it on the
+                # same device, the exact concurrent-PortAudio-streams crash risk
+                # confirmed elsewhere. Left untouched, same as always.
+                return
+            needs_interrupt = self.state in ("thinking", "acting")
+            if needs_interrupt:
+                self._interrupt_requested.set()
+
+        if needs_interrupt:
+            # A task is actively thinking/acting but NOT waiting on a reply —
+            # the mic is free. Request a cooperative park (4.4) instead of
+            # silently dropping the wake word: _act_observe's loop checks this
+            # flag at the top of each round (a safe point, never mid-tool-
+            # call) and parks the task with its real progress there, after
+            # which process_text's normal completion path returns state to
+            # idle. Wait (bounded) for that before proceeding — this is what
+            # keeps the two sessions from ever overlapping, the exact failure
+            # mode the original "ignore every active state" guard existed to
+            # prevent (confirmed via real testing: ambient noise self-
+            # triggering the wake word mid-execution corrupted a multi-step
+            # task) — resolved cooperatively now instead of by dropping the
+            # interrupt outright.
+            print("\n[WAKE WORD DETECTED mid-task — requesting park]")
+            deadline = time.time() + 8.0
+            while time.time() < deadline:
+                with self.lock:
+                    if self.state not in ("thinking", "acting"):
+                        break
+                time.sleep(0.05)
+            self._interrupt_requested.clear()
+
+        with self.lock:
+            if self.state not in ("idle", "speaking"):
+                # Didn't park cleanly within the wait above (a long tool call
+                # or round budget), or a reply-wait/second trigger started in
+                # the gap — safer to drop this trigger than risk starting a
+                # second overlapping session.
                 return
             print("\n[WAKE WORD DETECTED]")
             was_speaking = self.state == "speaking"
@@ -159,10 +223,27 @@ class VoiceController:
         # this exact path on every single utterance, not just an occasional
         # training session). start()/stop() are cheap here — the ONNX model is
         # already loaded, only the audio stream itself gets torn down and rebuilt.
+        #
+        # 2026-08-01: a real crash was traced to exactly this handoff — a python.exe
+        # access violation with the crashing thread's stack running through
+        # _cffi_backend -> libportaudio64bit.dll -> winmmbase.dll (confirmed via
+        # direct minidump analysis, not guessed), on a live session where rapid
+        # repeated wake triggers meant this stop/start cycle ran back-to-back many
+        # times in quick succession. capture.py's own _capture_loop docstring
+        # already documented this as a known, unresolved device-release race
+        # ("one call sat for ~9 minutes, another never returned at all") before
+        # today — closing the mic device and reopening it on the SAME hardware
+        # device isn't guaranteed instant at the OS/driver level, and the only
+        # gap previously in place was whatever the earcon's own playback happened
+        # to take. A small explicit settle delay on both sides of the handoff
+        # gives the driver a floor of real time to actually release/reacquire the
+        # device, independent of how long the earcon takes (or if it's skipped).
         self.listener.stop()
+        time.sleep(0.15)
         try:
             wav_bytes = self.capture.capture_until_silence()
         finally:
+            time.sleep(0.15)
             self.listener.start()
 
         if not wav_bytes:
@@ -177,9 +258,26 @@ class VoiceController:
         text = self.stt.transcribe(wav_bytes, extra_vocab=self._vocab_hint())
         if not text:
             print("Could not understand audio.")
-            self.broadcast_state("idle")
+            self.say("Sorry, I didn't catch that.", state_after="idle")
             return
             
+        # Confirmed live (2026-08-03): a brand-new wake-triggered capture had NO
+        # self-echo guard at all — unlike every other capture site in this app
+        # (ask_confirmation/ask_slot/the clarifying-question answer path/
+        # _followup_or_idle, all fixed 2026-07-31 for the exact same failure
+        # mode). Real trace: Pulse's own spoken apology ("I'm sorry, I don't
+        # have the context for that...") got picked up by its own mic moments
+        # after being said, transcribed, and dispatched here as a genuinely NEW
+        # top-level command — which then spiraled into an unrelated save_file
+        # call because the model fell back on conversation history to make
+        # sense of a nonsense "goal". _is_self_echo already exists and already
+        # handles a partial/truncated capture of a longer prior utterance
+        # (token_set_ratio) — it just was never wired in at this specific entry
+        # point before now.
+        if self._is_self_echo(text):
+            print(f"Ignoring likely self-echo as a fresh command: {text!r}")
+            self.broadcast_state("idle")
+            return
         print(f"User: {text}")
         asyncio.run_coroutine_threadsafe(
             self.ws_server.broadcast({"v": 1, "type": "transcript", "payload": text}),
@@ -301,7 +399,19 @@ class VoiceController:
         it was never an answer to. Confirmed live: "open outlook" spoken in
         reply to an unrelated yes/no prompt matched neither regex and used to
         just vanish after the retry, with the original stale intent proceeding
-        as if nothing had been said."""
+        as if nothing had been said.
+
+        Real gap found in review (2026-08-01): the fixed keyword lists below
+        are fine as a zero-latency fast path for the clear, common cases — but
+        a natural reply like "sounds good", "that's right", or "go for it, do
+        that" matches neither list. Before this fix, ANY 2+-word reply that
+        missed both lists was assumed to be an unrelated command and rerouted,
+        silently losing a genuine yes/no answer. A static keyword list can't
+        keep up with how flexibly people actually phrase agreement/refusal —
+        that's exactly the kind of judgment call worth handing to real
+        intelligence instead of trying to enumerate every phrasing by hand.
+        Only the genuinely ambiguous middle ground (2+ words, no keyword hit)
+        pays for that classification call; the fast path above is untouched."""
         import re
         for _ in range(2):
             answer, _ = self._ask(question)
@@ -311,11 +421,44 @@ class VoiceController:
             if re.search(r"\b(no|nope|stop|cancel|don't|abort)\b", answer):
                 return False
             if len(answer.split()) >= 2:
+                intent = self._classify_yes_no_or_other(question, answer)
+                if intent == "yes":
+                    return True
+                if intent == "no":
+                    return False
                 print(f"ask_confirmation: unrelated command detected mid-question, rerouting: {answer!r}")
                 self._safe_thread(self.process_text, answer)
                 return False
             question = "Sorry, I didn't catch that. Please say yes or no."
         return False
+
+    def _classify_yes_no_or_other(self, question: str, answer: str) -> str:
+        """Cheap, single-call classification for a confirmation reply that
+        missed ask_confirmation's fast keyword lists — real judgment instead
+        of guessing from keyword absence. Returns "yes", "no", or "other" (the
+        reply isn't actually answering the question — a genuinely different
+        new instruction). Any failure (timeout, bad response) defaults to
+        "other", preserving the original safe behavior rather than risking a
+        wrong yes/no on a shaky classification."""
+        schema = {
+            "type": "object",
+            "properties": {"intent": {"type": "string", "enum": ["yes", "no", "other"]}},
+            "required": ["intent"]
+        }
+        system_prompt = (
+            "You classify a spoken reply to a yes/no confirmation question. Respond with "
+            "exactly one of: yes, no, other. 'yes' = affirmative in any natural phrasing "
+            "(\"sounds good\", \"that's right\", \"go for it\", \"do that\"). 'no' = negative "
+            "in any natural phrasing (\"nah, leave it\", \"don't bother\", \"not now\"). "
+            "'other' = the reply isn't actually answering the question at all — a genuinely "
+            "different new instruction unrelated to what was asked."
+        )
+        try:
+            resp = self.planner.prompt(system_prompt, f"QUESTION: {question}\nREPLY: {answer}", schema)
+            return resp.get("intent", "other")
+        except Exception as e:
+            print(f"_classify_yes_no_or_other failed, defaulting to 'other': {e}")
+            return "other"
 
     def ask_slot(self, question: str, default: str = None, timeout_s: float = 6.0) -> str:
         """Ask for ONE missing piece of information (not yes/no — see ask_confirmation
@@ -323,9 +466,25 @@ class VoiceController:
         within timeout, or nothing understood, returns `default` unchanged — callers
         decide what that means (announce-and-proceed if default is a real value,
         park the task if default is None). This is what makes "automate everything
-        possible" actually hold: a slot question can never hang forever."""
+        possible" actually hold: a slot question can never hang forever.
+
+        Real bug found 2026-08-01 (user-reported: a follow-up compound task after
+        "continue" produced confused, broken behavior): unlike ask_confirmation
+        (which already reroutes an unrelated command instead of forcing it through
+        a yes/no classifier), this method used to accept WHATEVER text came back
+        completely unquestioned — including a fresh, unrelated new command the user
+        gave instead of actually answering the re-asked pending question. The only
+        caller (the "continue" flow) then glued that raw text straight onto the
+        OLD goal (f"{goal} — {slot}: {answer}") and handed it to the planner as if
+        it were a real answer — corrupting BOTH: the new command never actually ran
+        as its own task, and the old one got fed nonsense it was never told. Same
+        rerouting principle as ask_confirmation now applies here too."""
         answer, _ = self._ask(question, no_speech_timeout_s=timeout_s)
         answer = answer.strip()
+        if answer and self._COMPOUND_ACTION_VERBS.search(answer) and len(answer.split()) >= 4:
+            print(f"ask_slot: unrelated command detected mid-question, rerouting: {answer!r}")
+            self._safe_thread(self.process_text, answer)
+            return default
         return answer if answer else default
 
     _STATIC_FOLDERS = ("desktop", "documents", "downloads", "pictures", "music", "videos")
@@ -380,9 +539,37 @@ class VoiceController:
         m = _re.match(r"^(?:close|quit)(?:\s+(?:my\s+|the\s+)?(.+))?$", norm_text)
         if m:
             target = (m.group(1) or "").strip()
+            # "close it"/"close this"/"close that" mean the same no-target case as
+            # bare "close" -- a pronoun isn't a real app name, so it must never
+            # reach close_app literally (it would just fail to match any process).
+            if target.lower() in ("it", "this", "that"):
+                target = ""
             return ("close_app", target or "__focused__")
 
         return None
+
+    def _resume_goal_text(self, parked: dict, extra: str = "") -> str:
+        """Restores a parked task's real action history into the text handed to a
+        fresh process_text call on resume. Confirmed 2026-08-03: append_history was
+        already durably persisting every tool result to history_json on every
+        round, but nothing anywhere ever read it back — "continue" always called
+        process_text(goal) verbatim, which creates a brand-new task_id
+        (create_task) and starts _act_observe with all_results = [], discarding
+        everything the task had genuinely already done (files opened, searches
+        run, content typed) before it paused. Same fix as the in-loop
+        question/answer history-dropping bug, applied at the park/resume boundary
+        instead."""
+        import json as _json
+        history = self.tasks.get_history(parked["id"])
+        results = [
+            {**(h.get("result") or {}), "_tool": h.get("tool"), "_params": h.get("params")}
+            for h in history if h.get("role") == "tool"
+        ]
+        goal_text = f"{parked['goal']}{extra}"
+        if results:
+            goal_text += (f"\nACTIONS ALREADY PERFORMED BEFORE THIS PAUSE (most recent last): {_json.dumps(results)}\n"
+                          "Continue from here — do not repeat any of the work already listed above.")
+        return goal_text
 
     def process_text(self, text: str):
         # Direct intents that bypass the planner (reliability > flexibility for these)
@@ -414,8 +601,75 @@ class VoiceController:
         if _re.search(r"(train|learn|teach).{0,15}(voice|wake)", low):
             self.train_wake_word()
             return
+        m = _re.search(r"(change|set|rename).{0,15}wake.{0,10}word.{0,10}to\s+(\w+)", low)
+        if m:
+            self.train_wake_word(word=m.group(2))
+            return
+        if _re.search(r"(list|what).{0,15}microphones?\b", low):
+            devs = self.list_input_devices()
+            if not devs:
+                self._speak_broadcast("I couldn't find any microphones.")
+            else:
+                names = ", ".join(d["name"] for d in devs)
+                self._speak_broadcast(f"Available microphones: {names}.")
+            self.broadcast_state("idle")
+            return
+        m = _re.search(r"(?:switch to|use|change to)\s+(?:the\s+)?(.+?)\s+microphone\b", low)
+        if m:
+            query = m.group(1).strip()
+            devs = self.list_input_devices()
+            if not devs:
+                self._speak_broadcast("I couldn't find any microphones to switch to.")
+                self.broadcast_state("idle")
+                return
+            from rapidfuzz import process as _rf_process, fuzz as _rf_fuzz, utils as _rf_utils
+            choices = [d["name"] for d in devs]
+            # partial_ratio + default_process (lowercases, strips punctuation): device
+            # names are long descriptive strings ("USB Headset Microphone") while a
+            # spoken query is a short fragment, same query-is-substring-of-longer-name
+            # shape the file-search tool already handles with this exact combo.
+            match = _rf_process.extractOne(query, choices, scorer=_rf_fuzz.partial_ratio, processor=_rf_utils.default_process)
+            if not match or match[1] < 70:
+                self._speak_broadcast(f"I couldn't find a microphone matching '{query}'.")
+                self.broadcast_state("idle")
+                return
+            chosen = next(d for d in devs if d["name"] == match[0])
+            self.set_input_device(chosen["id"])
+            self._speak_broadcast(f"Switched to {chosen['name']}.")
+            self.broadcast_state("idle")
+            return
+        m = _re.search(r"(?:switch|change|set|go)\s+(?:to|into)?\s*(minimal|standard|guided)\s+mode\b", low) \
+            or _re.search(r"\b(minimal|standard|guided)\s+mode\b", low)
+        if m:
+            mode_word = m.group(1).capitalize()
+            self.feedback_mode = mode_word
+            self._speak_broadcast(f"Switched to {mode_word} mode.")
+            self.broadcast_state("idle")
+            return
         if _re.search(r"^(repeat|say (that|it) again|what did you say)\b", low):
             self._speak_broadcast(self.last_spoken or "I haven't said anything yet.")
+            self.broadcast_state("idle")
+            return
+        if _re.search(r"^(are you (there|there\??|listening|awake)|you there)\??$", low):
+            # Deterministic, zero-LLM-round-trip on purpose — this is exactly the
+            # phrase a user reaches for when the AI seems stuck, so the answer
+            # can't depend on the AI being responsive. Reports real state (J11:
+            # "speaks state + active/parked task"), not just a static "yes".
+            parked = self.tasks.get_parked_task()
+            if parked:
+                msg = f"Yes, I'm here. I've got a paused task waiting — {parked['goal']}. Say \"continue\" whenever you're ready."
+            else:
+                msg = "Yes, I'm here and ready."
+            self._speak_broadcast(msg)
+            self.broadcast_state("idle")
+            return
+        if _re.search(r"^(start over|reset)\b", low):
+            parked = self.tasks.get_parked_task()
+            if parked:
+                self.tasks.unpark_task(parked["id"], new_status="cancelled")
+                self._speak_broadcast("Okay, starting over — I've cleared what was waiting.")
+            else:
+                self._speak_broadcast("Okay, starting over.")
             self.broadcast_state("idle")
             return
         if _re.search(r"^(continue|resume|keep going|where were we)\b", low):
@@ -429,14 +683,14 @@ class VoiceController:
                 # original goal back up, no question to re-ask.
                 self.tasks.unpark_task(parked["id"])
                 self._speak_broadcast(f"Picking that back up — {parked['goal']}.")
-                self.process_text(parked["goal"])
+                self.process_text(self._resume_goal_text(parked))
                 return
             # One-line context restatement, then re-ask exactly what was pending —
             # no re-deriving the question, it's stored verbatim from when it parked.
             answer = self.ask_slot(f"Continuing — {parked['goal']}. {parked['pending_question']}")
             if answer:
                 self.tasks.unpark_task(parked["id"])
-                self.process_text(f"{parked['goal']} — {parked['pending_slot']}: {answer}")
+                self.process_text(self._resume_goal_text(parked, extra=f" — {parked['pending_slot']}: {answer}"))
             else:
                 # Still nothing — re-park the SAME task rather than losing it or
                 # looping the question again right now.
@@ -587,6 +841,19 @@ class VoiceController:
                 self.broadcast_state("idle")
                 return
 
+        # Q&A fast path (5.1/5.3): a direct question ("what's the capital of
+        # France") or a summarize/describe-this request doesn't need
+        # task_list decomposition, step verification, or missing_info
+        # tracking — none of the full multi-step machinery below applies.
+        # Checked AFTER the static action lane (so "what's on my screen"
+        # etc., already handled above via read_everything, never reaches
+        # here) and BEFORE task creation, so a real task never pays for this
+        # check either way — _looks_like_qa_request is a cheap regex, not a
+        # planner round.
+        if self._looks_like_qa_request(text):
+            self._answer_question(text)
+            return
+
         self.broadcast_state("thinking")
         # 2. Planning
         task_id = self.tasks.create_task(text)
@@ -634,7 +901,8 @@ class VoiceController:
         except Exception:
             pass
 
-        step_results = self._run_task_loop(task_id, text, system_prompt)
+        with log_elapsed(logger, f"run_task_loop[{text[:40]!r}]"):
+            step_results = self._run_task_loop(task_id, text, system_prompt)
         # _pending_question stays True only when _act_observe just parked the task
         # (an unanswered clarifying question) — must not stomp that 'waiting_input'
         # status back to 'completed' right after setting it.
@@ -697,6 +965,123 @@ class VoiceController:
     def _looks_compound(self, goal: str) -> bool:
         return len(set(m.lower() for m in self._COMPOUND_ACTION_VERBS.findall(goal))) >= 2
 
+    # Question-word/auxiliary-first starters for the Q&A fast path (5.1) —
+    # deliberately conservative: ANY _COMPOUND_ACTION_VERBS match (open/save/
+    # click/etc.) disqualifies a match regardless of phrasing, so "can you
+    # open notepad" (a command dressed as a question) still falls through to
+    # the full task path below, never gets stuck in the Q&A lane's
+    # limited tool access.
+    _QUESTION_STARTERS = re.compile(
+        r"^(what|who|when|where|why|how|which|whose|is|are|was|were|do|does|"
+        r"did|can|could|would|will|should|has|have|had)\b", re.I
+    )
+    # "Summarize/describe/read this" style requests (5.3) — same lean Q&A
+    # lane, just answered via read_screen/look_at_screen instead of
+    # web_search. Not phrased as questions at all ("summarize this page"),
+    # so they need their own starter pattern rather than piggybacking on
+    # _QUESTION_STARTERS above.
+    _SUMMARIZE_STARTERS = re.compile(
+        r"^(summarize|summarise|describe|explain)\b|"
+        r"\b(tell me about|what does (this|it) say|read (this|it) (to me|out|aloud))\b",
+        re.I
+    )
+
+    def _looks_like_qa_request(self, text: str) -> bool:
+        stripped = text.strip()
+        if not stripped or self._COMPOUND_ACTION_VERBS.search(stripped):
+            return False
+        return (bool(self._QUESTION_STARTERS.match(stripped)) or stripped.endswith("?")
+                or bool(self._SUMMARIZE_STARTERS.search(stripped)))
+
+    def _answer_question(self, text: str):
+        """Q&A fast path (5.1/5.2/5.3): a lean, dedicated lane for direct
+        questions AND summarize/describe-this requests that skips the full
+        multi-step task machinery entirely — no task_list decomposition, no
+        step verification, no missing_info tracking, none of which either
+        needs. No retry/loop-detection needed for a read-only exchange the way
+        a multi-step task needs it. Routed here by _looks_like_qa_request in
+        process_text, before _run_task_loop is ever reached. Long answers get
+        chunked with section checkpoints in Guided mode (5.4) — see the tail
+        of this method.
+
+        Real gap found in review (2026-08-01): this used to be a rigid 2-call
+        sequence — exactly one optional tool call, then a SECOND round forced
+        with "you already have what you need" regardless of whether the first
+        result was actually sufficient. That can't answer "read this error and
+        look up what it means" (genuinely needs read_screen THEN web_search),
+        and can't retry a web_search that came back empty/unhelpful. Research
+        on 2026 agent design confirms adaptive tool-call budgets outperform
+        fixed ones — the fix here isn't "always allow more calls" (that just
+        moves the rigidity, and this lane's whole point is staying fast), it's
+        letting the MODEL decide each round whether it has enough, with a
+        small bounded cap as a safety backstop, not a target."""
+        from core.planner.prompts import get_qa_prompt
+        self.broadcast_state("thinking")
+        schema = registry.get_qa_schema()
+        system_prompt = get_qa_prompt()
+        MAX_TOOL_ROUNDS = 2  # covers e.g. read_screen then web_search; still far below the full task lane's 50
+        user_text = text
+        tool_rounds_used = 0
+        response = None
+        while tool_rounds_used <= MAX_TOOL_ROUNDS:
+            response = self.planner.prompt(user_text=user_text, system_prompt=system_prompt, schema=schema)
+            if not response:
+                self._speak_broadcast("I'm sorry, I ran into a problem thinking that through.")
+                self.broadcast_state("idle")
+                return
+            plan = response.get("plan") or []
+            if not plan:
+                break  # the model's OWN call that it has enough -- not a forced round count
+            if tool_rounds_used == MAX_TOOL_ROUNDS:
+                # Hit the safety cap with the model still wanting to act — force
+                # one last synthesis-only round rather than using this round's
+                # "about to do X" speak text (which was never meant as a final answer).
+                user_text = (
+                    f"REQUEST: {text}\nYou're out of additional lookups for this fast lane — "
+                    "answer now with your best understanding from what you've already gathered "
+                    "(empty plan)."
+                )
+                response = self.planner.prompt(user_text=user_text, system_prompt=system_prompt, schema=schema)
+                break
+            step = plan[0]
+            result, status = self._execute_with_heartbeat(step.get("tool", "web_search"), step.get("params", {}))
+            tool_rounds_used += 1
+            user_text = (
+                f"REQUEST: {text}\nTOOL RESULT: {result}\n"
+                "Decide for yourself: do you have enough to answer now (empty plan) — with honest "
+                "source attribution if it came from web_search, or saying plainly if it came back "
+                "empty/offline — or do you genuinely need one more tool call to actually answer this "
+                "(e.g. that search came back empty, or you read the screen and now need to search for "
+                "what it showed). Your call, not a forced next step."
+            )
+        answer = response.get("speak") or "I don't have a good answer for that."
+        # Long-content section checkpoints (5.4), Guided mode only — Standard
+        # mode reads continuously (self.tts.speak already sentence-chunks for
+        # streaming playback, and existing TTS barge-in interrupts it exactly
+        # like any other speech — no new mechanism needed for that case).
+        # Guided mode's whole design is frequent check-ins/orientation (see
+        # FEEDBACK MODE rules in prompts.py), so a long answer (e.g.
+        # summarizing a full article via read_screen) gets read a few
+        # sentences at a time with an explicit "keep going?" between
+        # sections, reusing ask_confirmation — same pattern already used for
+        # every other yes/no check-in in this app, not a new mechanism.
+        sentences = self.tts._chunk_text(answer)
+        if self.feedback_mode == "Guided" and len(sentences) > 3:
+            section_size = 3
+            for i in range(0, len(sentences), section_size):
+                section = " ".join(sentences[i:i + section_size])
+                is_last_section = i + section_size >= len(sentences)
+                self._speak_broadcast(section)
+                if is_last_section:
+                    break
+                if not self.ask_confirmation("Want me to keep reading?"):
+                    self._speak_broadcast("Okay, stopping there.")
+                    self.broadcast_state("idle")
+                    return
+        else:
+            self._speak_broadcast(answer)
+        self.broadcast_state("idle")
+
     def _run_task_loop(self, task_id, goal, system_prompt, max_iterations=50):
         """Plan-and-execute: for a complex multi-part goal the planner first returns a
         spoken-language `task_list` breakdown; we persist it and run each step through
@@ -707,6 +1092,19 @@ class VoiceController:
         it keeps long jobs like "install python" on track without hardcoding any
         specific workflow."""
         self._pending_question = False
+        # Confirmed live (2026-08-01): a compound goal ("open notepad, type X,
+        # save it") splits into independent steps in _execute_task_list, each
+        # running its OWN fresh _act_observe call. asked_gaps used to be a
+        # purely local variable there, reset to empty on every single step —
+        # so a missing filename/location got asked about, defaulted, and then
+        # asked about AGAIN from scratch on step 2, and again on step 3, since
+        # nothing remembered it had already been resolved for the task as a
+        # whole. This set is shared (by reference) across every _act_observe
+        # call for the WHOLE task — root-level, per-step, and any nested
+        # recursive decomposition — reset only here, at the one true start of
+        # a new top-level task, so a gap already asked about anywhere in this
+        # task is never re-asked anywhere else in it.
+        self._task_asked_gaps = set()
         response = self.planner.prompt(user_text=goal, system_prompt=system_prompt,
                                          schema=registry.get_planner_schema())
         if not response:
@@ -714,7 +1112,17 @@ class VoiceController:
             return []
 
         task_list = [s for s in (response.get("task_list") or []) if s.strip()]
-        if len(task_list) <= 1 and self._looks_compound(goal):
+        # Confirmed live (2026-08-04): this retry used to fire unconditionally,
+        # even when round 1's own response had already correctly flagged genuine
+        # ambiguity (missing_info/missing_info_required set, e.g. the model asking
+        # what an unclear phrase like "drag down the whole plan" actually meant) —
+        # discarding that real uncertainty and forcing it to just guess a
+        # task_list instead. If it already raised a genuine question, let the
+        # normal missing-info handling (inside _act_observe, reached via the
+        # single-part-goal path below since task_list is still <=1) actually ask
+        # it, instead of overriding it here.
+        has_genuine_question = bool((response.get("missing_info") or "").strip()) or bool(response.get("missing_info_required"))
+        if len(task_list) <= 1 and self._looks_compound(goal) and not has_genuine_question:
             # Reasoning-action disconnect (confirmed live 2026-07-29, from a real
             # trace): the model's own "reasoning" text said "this requires a
             # task_list" while the actual task_list array came back empty —
@@ -775,13 +1183,28 @@ class VoiceController:
         # so the early-exit below could never fire for that case even once the
         # real save happened. mtime changing is the actual signal.
         goal_mtime_at_start = self._goal_file_mtime(goal)
+        # Confirmed live (2026-08-03): "COMPLETED SO FAR" only ever carried step
+        # DESCRIPTIONS ("Search the internet for X"), never what that step actually
+        # found — so a later step ("Write the plan") had zero access to an earlier
+        # step's real web_search results and reasonably re-ran the search from
+        # scratch, wasting a full round-trip and producing a visibly repeated
+        # action. Fixed by threading forward the immediately PRECEDING step's own
+        # results only (not the whole task's growing history — that's exactly what
+        # caused the original 55KB-prompt-bloat bug this per-step isolation exists
+        # to prevent) — bounded to one step's worth of data, capped as a safety net.
+        last_step_results = None
         for i, step_goal in enumerate(task_list):
             with conn:
                 conn.execute("UPDATE tasks SET current_step = ? WHERE id = ?", (i, task_id))
             sub_goal = (f"OVERALL GOAL: {goal}\nCURRENT STEP ({i + 1} of {n}): {step_goal}\n"
-                        f"COMPLETED SO FAR: {task_list[:i]}\nDo only this step now.")
+                        f"COMPLETED SO FAR: {task_list[:i]}\n"
+                        + (f"RESULTS FROM THE STEP YOU JUST FINISHED (use this data directly if it's what "
+                           f"this step needs — do not re-fetch it): {_json.dumps(last_step_results)[:4000]}\n"
+                           if last_step_results else "")
+                        + "Do only this step now.")
             results = self._act_observe(task_id, sub_goal, system_prompt, max_rounds=50,
                                          _depth=depth, completed_steps=task_list[:i])
+            last_step_results = results
             all_results.extend(results)
             # A step's act-observe loop often (legitimately) completes MORE
             # than its own step — confirmed live: step 1 finished the entire
@@ -789,6 +1212,19 @@ class VoiceController:
             # re-saved) because nothing checked the overall end state. If the
             # goal's objective end state is now reached, stop here.
             if self._goal_file_mtime(goal) not in (None, goal_mtime_at_start):
+                return all_results
+            # _goal_file_mtime only fires when the ORIGINAL goal text names a
+            # literal filename — confirmed live (2026-08-01): "open notepad
+            # and type hello world" (no filename given) never matches that
+            # regex, so it can never catch "we already saved with a default
+            # name" either. This is a second, code-level objective signal
+            # that doesn't depend on the goal text at all: a genuine save_file
+            # success already happened THIS task, and the file it reports is
+            # actually still on disk. Confirmed live this exact test case
+            # (asked_gaps fix alone stopped the repeated question, but steps
+            # 2-3 still retyped and re-saved an already-finished document
+            # before this was added).
+            if self._task_already_saved(all_results):
                 return all_results
             if getattr(self, "_pending_question", False):
                 # This step parked awaiting an answer — stop here instead of
@@ -803,7 +1239,7 @@ class VoiceController:
                     return all_results
         return all_results
 
-    def _verify_saved_file(self, goal: str) -> bool:
+    def _verify_saved_file(self, goal: str, all_results: list = None) -> bool:
         """Objective, code-level check for save/write goals — don't just trust the
         model's self-reported task_step_done. Confirmed live: a click on a save
         dialog's confirm button returned {"success": true} and the model declared
@@ -813,7 +1249,18 @@ class VoiceController:
         actually landed on disk. Same principle as code-level loop detection:
         the model missing its own mistake is expected sometimes, so verify
         externally rather than trust the self-report. Returns True (nothing to
-        check, trust the model) if the goal doesn't name a specific file."""
+        check, trust the model) if the goal doesn't name a specific file.
+
+        Real gap found in review (2026-08-01): this used to ONLY regex the
+        filename out of the ORIGINAL GOAL text — so a vaguer request ("save
+        this as my grocery list", no extension; "write a haiku and save it", no
+        name at all) never matched, and this whole check silently returned True
+        (trust the model) on exactly the requests where the model has to invent
+        a filename itself and is most likely to get the save wrong. Fixed:
+        check the REAL save_file tool call's own filename param first — that's
+        what actually got used, not a guess reconstructed from the user's
+        words — and only fall back to the goal-text regex if no save_file call
+        is found in this step's results at all."""
         import re
         from pathlib import Path
         # For a multi-step sub-goal, only the CURRENT STEP matters here — an
@@ -824,6 +1271,9 @@ class VoiceController:
         check_text = m_step.group(1) if m_step else goal
         if "save" not in check_text.lower():
             return True
+        for r in reversed(all_results or []):
+            if isinstance(r, dict) and r.get("_tool") == "save_file" and r.get("_params", {}).get("filename"):
+                return self._file_on_disk(r["_params"]["filename"].strip())
         m = re.search(r'\b([\w\-]+\.\w{2,5})\b', goal)
         if not m:
             return True
@@ -874,6 +1324,27 @@ class VoiceController:
                 except Exception:
                     return None
         return None
+
+    def _task_already_saved(self, all_results: list) -> bool:
+        """Code-level 'did any step of THIS task already genuinely save a file',
+        independent of whether the goal text happens to name one (see
+        _goal_file_mtime, which can't fire without a literal filename in the
+        goal). Matches specifically on save_file's own success message shape
+        ("Saved to {path}") rather than just any dict with a "path" key —
+        open_file and download_file also return {"success": True, "path":
+        ...}, and would false-positive a real "we're done" signal from an
+        unrelated tool call. Verifies the path is still actually on disk
+        rather than trusting the stored result alone — same don't-trust-a-
+        stale-self-report principle as _verify_saved_file."""
+        from pathlib import Path
+        for r in all_results:
+            if not isinstance(r, dict) or not r.get("success"):
+                continue
+            message = r.get("message", "")
+            path = r.get("path")
+            if path and message.startswith("Saved to ") and Path(path).exists():
+                return True
+        return False
 
     def _save_call_missing_info(self, goal: str, steps: list) -> str:
         """Purely code-driven backstop for save_file specifically — confirmed
@@ -1013,7 +1484,15 @@ class VoiceController:
         # whole round budget looping.
         recent_actions = []
         stuck_hint_given = False
-        asked_gaps = set()  # normalized missing_info strings already asked about this task
+        # Shared (by reference) across every step of the whole task — see the
+        # comment in _run_task_loop on self._task_asked_gaps for why this is
+        # no longer a fresh set per call. Defensive fallback (a new empty set)
+        # only covers the case of _act_observe somehow being called without
+        # going through _run_task_loop first, which shouldn't happen in
+        # practice but must not crash if it ever does.
+        asked_gaps = getattr(self, "_task_asked_gaps", None)
+        if asked_gaps is None:
+            asked_gaps = self._task_asked_gaps = set()
         identity_checked = False  # see _document_identity_gate — fires at most once per task
         # Confirmed live: even when told exactly what to ask and why, the model's
         # own missing_info_required self-report on the ASKING round is still
@@ -1026,6 +1505,20 @@ class VoiceController:
         last_expected_effect = ""  # carried into next round's context, see below
         save_verify_failures = 0  # escalating counter, see the task_done check below
         for iteration in range(max_rounds):
+            if self._interrupt_requested.is_set():
+                # Park-on-interrupt (4.4): a wake word fired mid-task
+                # (on_wake_word_detected) — checked ONLY here, at the top of
+                # a round, between planner calls/tool executions, never
+                # mid-call. Mirrors the existing loop-detector "stuck" park
+                # exactly (same park_task call, same _pending_question
+                # signal) so every downstream consumer of a parked task
+                # (process_text's completion-status guard, _execute_task_list's
+                # early-exit check, the "continue" resume path) already
+                # handles this correctly with no further changes needed.
+                self._interrupt_requested.clear()
+                self.tasks.park_task(task_id, "continuation", goal)
+                self._pending_question = True
+                return all_results
             if initial_response is not None and iteration == 0:
                 response = initial_response
             else:
@@ -1085,7 +1578,7 @@ class VoiceController:
             # to this deliberately every round rather than it falling out
             # incidentally from "no more actions occurred to me right now".
             task_done = bool(response.get("task_step_done", False))
-            if task_done and not self._verify_saved_file(goal):
+            if task_done and not self._verify_saved_file(goal, all_results):
                 # Escalating, bounded verification failure — confirmed live:
                 # Word's preview edition can ONLY save to OneDrive cloud, so no
                 # amount of retrying puts the file where the user asked; the old
@@ -1185,7 +1678,14 @@ class VoiceController:
                     )
                     self._pending_question = False
                     pending_is_defaultable = False
-                    user_text = f"GOAL: {goal}\nPREVIOUS QUESTION: {speak_text}\nUSER'S ANSWER: {answer}"
+                    # Same history-dropping bug as the no-reply/defaultable branch below —
+                    # carry the real action history forward instead of losing it the
+                    # moment a question gets answered. Local import: this branch can be
+                    # reached before the loop's own later `import json as _json` (line
+                    # ~1767) ever runs in this same call.
+                    import json as _json
+                    user_text = (f"GOAL: {goal}\nPREVIOUS QUESTION: {speak_text}\nUSER'S ANSWER: {answer}\n"
+                                 f"ACTIONS YOU (PULSE) JUST PERFORMED AND THEIR RESULTS (most recent last): {_json.dumps(all_results)}")
                     continue
                 # No answer. DEFAULTABLE means silence -> use defaults, per the
                 # locked ask-once-then-fallback design — NOT a parked task. Only
@@ -1199,9 +1699,19 @@ class VoiceController:
                 pending_is_defaultable = False
                 if was_defaultable:
                     self._pending_question = False
+                    # Confirmed live (2026-08-03): this override used to replace user_text
+                    # with just the bare goal + question + "no reply" filler, DROPPING the
+                    # entire all_results history a normal round always includes (see the
+                    # ACTIONS-YOU-JUST-PERFORMED construction below) — so the model, having
+                    # silently lost all memory of already opening the app/searching/writing,
+                    # reasonably started the whole task over from scratch. Carrying the same
+                    # real history forward here closes that. Local import: this branch can
+                    # be reached before the loop's own later `import json as _json` runs.
+                    import json as _json
                     user_text = (f"GOAL: {goal}\nPREVIOUS QUESTION: {speak_text}\nUSER'S ANSWER: (no reply — "
                                  "use the defaults: Desktop, and pick a short sensible filename yourself. "
-                                 "Proceed now, do not ask again.)")
+                                 "Proceed now, do not ask again.)\n"
+                                 f"ACTIONS YOU (PULSE) JUST PERFORMED AND THEIR RESULTS (most recent last): {_json.dumps(all_results)}")
                     continue
                 self.tasks.park_task(task_id, "clarification", speak_text)
                 self._speak_broadcast('I\'ll hold onto that — say "continue" whenever you\'re ready.')
@@ -1244,6 +1754,13 @@ class VoiceController:
                     self.loop
                 )
                 print(f"Action: {tool_name}({params})")
+                # 2026-08-03: removed the runtime save-authorization gate (was
+                # _classify_save_authorized, an extra Gemma call before every
+                # save_file). Per direct decision — prompts.py now carries a
+                # paired-contrast worked example (rule 64) plus a restated
+                # trigger condition on the "Saving a document" section (rule
+                # 68), which is judged sufficient on its own; an extra runtime
+                # judgment call was redundant with fixing the actual prompt.
                 result, status = self._execute_with_heartbeat(tool_name, params)
                 if status == "needs_confirmation":
                     if self.ask_confirmation(f"This will run {tool_name.replace('_', ' ')}. Should I continue?"):
@@ -1254,6 +1771,13 @@ class VoiceController:
                         all_results.append({"cancelled": True})
                         return all_results
                 print(f"Result: {result} (Status: {status})")
+                # Tag with which tool/params actually produced this result —
+                # _verify_saved_file needs the REAL filename a save_file call
+                # used, not a guess regexed out of the goal text (see its own
+                # docstring). Same enrich-in-place pattern _new_window_appeared
+                # already uses on tool results elsewhere in this file.
+                if isinstance(result, dict):
+                    result = {**result, "_tool": tool_name, "_params": params}
                 all_results.append(result)
                 self.tasks.append_history(task_id, {"role": "tool", "tool": tool_name, "params": params, "result": result})
 
@@ -1408,7 +1932,16 @@ class VoiceController:
         so silence is never the answer: ask what to do HERE, and on no reply read every
         element on the current screen to orient them, then listen once more."""
         superhero = self.feedback_mode == "Guided"
-        timeout = 4.0 if superhero else 6.0
+        # Found in review (2026-08-01): this used to give Guided mode LESS time
+        # (4.0s) than Standard (6.0s) to reply, with nothing documenting why —
+        # backwards from what you'd expect for the mode built specifically for
+        # blind/low-vision users who may be relying on audio alone, without the
+        # visual cues a sighted user gets for free, and may simply need more time
+        # to respond. Widened to 7.0s (longer than Standard, not just equal) —
+        # the fallback below (full screen read when there's no reply) is a good
+        # pattern for genuine silence, but shortening the window a Guided-mode
+        # user gets to actually respond isn't the right way to get there faster.
+        timeout = 7.0 if superhero else 6.0
         text, was_cancelled = self._ask(
             "What would you like me to do here?" if superhero else "What would you like me to do now?",
             no_speech_timeout_s=timeout
@@ -2085,6 +2618,80 @@ class VoiceController:
                     self.tts.speak(f"Now in {spoken}.")
                 last = title
 
+    def _mic_watchdog_loop(self):
+        """Zero mic-loss detection existed before this: WakeListener.stream.active
+        can stay True even after the underlying device disappears (PortAudio/Windows
+        keeps the stream object alive), so callback recency is the real signal —
+        stamped every real frame in WakeListener._audio_callback. Polls rather than
+        reacting to an OS device-removal event since there's no cheap cross-process
+        hook for that here. Requires 3 consecutive bad polls (~9s) of an 8s-stale
+        callback before acting — widened from an initial 2-poll/5s design after a
+        real false-positive was reported (see below), giving real CPU contention
+        (LLM inference, TTS synthesis competing for the same cores) much more room
+        before this fires.
+
+        Skips entirely whenever self.state == "acting" — this is the SAME signal
+        train_wake_word already uses to mean "exclusive work in progress, don't
+        touch shared resources". Real bug found and fixed here: this loop and
+        train_wake_word's own self.listener.stop()/start() (which it does
+        deliberately, to avoid two concurrent PortAudio streams on one device —
+        see _train_wake_flow's own comment) had NO coordination between them.
+        Training holds is_running False for its own multi-minute duration, which
+        this loop's is_running check already respected — but a watchdog retry
+        cycle already in flight (its own stop()/start() calls, up to ~9s across 3
+        attempts) could still race training's start of that same sequence, since
+        neither loop knew about the other. Gating on self.state == "acting" closes
+        that race outright rather than trying to fix the timing."""
+        consecutive_bad = 0
+        gave_up = False
+        while True:
+            time.sleep(2.5)
+            try:
+                if not self.listener.is_running or self.state == "acting":
+                    consecutive_bad = 0
+                    gave_up = False
+                    continue
+                stream = self.listener.stream
+                last_cb = self.listener._last_callback_time
+                healthy = (
+                    stream is not None and stream.active and
+                    last_cb is not None and time.time() - last_cb < 8.0
+                )
+                if healthy:
+                    consecutive_bad = 0
+                    gave_up = False
+                    continue
+                consecutive_bad += 1
+                if consecutive_bad < 3 or gave_up:
+                    continue
+                consecutive_bad = 0
+                # state_after="acting" (not left dangling at "speaking", the other
+                # real bug found here) — the UI stays honest about ongoing recovery
+                # work for the full multi-second retry sequence below, instead of
+                # showing a stale "speaking" pill with nothing actually happening.
+                self.say("I've lost the microphone. Trying to reconnect.", state_after="acting")
+                recovered = False
+                for attempt in range(3):
+                    time.sleep(1.5 * (attempt + 1))
+                    try:
+                        self.listener.stop()
+                        self.listener.start()
+                        time.sleep(1.0)
+                        last_cb = self.listener._last_callback_time
+                        if (self.listener.stream is not None and self.listener.stream.active and
+                                last_cb is not None and time.time() - last_cb < 3.0):
+                            recovered = True
+                            break
+                    except Exception as e:
+                        print(f"Mic watchdog reconnect attempt {attempt + 1} failed: {e}")
+                if recovered:
+                    self.say("Microphone reconnected.", state_after="idle")
+                else:
+                    self.say("I still can't find a microphone. You can still type commands.", state_after="idle")
+                    gave_up = True
+            except Exception as e:
+                print(f"Mic watchdog error: {e}")
+
     def list_input_devices(self):
         import sounddevice as sd
         devs = []
@@ -2107,6 +2714,7 @@ class VoiceController:
         conn = get_db()
         row = conn.execute("SELECT value FROM settings WHERE key='onboarded'").fetchone()
         if row:
+            self.say("Pulse is ready.", state_after="idle")
             return
         self.say("Welcome to Pulse, your voice assistant. Everything runs on your computer and stays private. Let me check your microphone. Please say anything after the beep.")
         self.capture.play_earcon()
@@ -2142,6 +2750,23 @@ class VoiceController:
     # ones that need the "remembered target" window pulled to front first.
     _FOCUS_SENSITIVE_TOOLS = frozenset({"read_screen", "fill_element", "click_element", "send_keys", "save_file"})
 
+    # Same visible-window filter as DescribeScreenTool.IGNORE (system_tools.py)
+    # — kept as a separate literal rather than importing that class's constant
+    # to avoid coupling this generic controller-level check to one specific
+    # tool's own scope.
+    _WINDOW_TITLE_IGNORE = ("Program Manager", "Windows Input Experience", "Settings", "")
+
+    def _list_top_level_window_titles(self) -> set:
+        import win32gui
+        titles = set()
+        def cb(h, _):
+            if win32gui.IsWindowVisible(h):
+                t = win32gui.GetWindowText(h)
+                if t and t not in self._WINDOW_TITLE_IGNORE:
+                    titles.add(t)
+        win32gui.EnumWindows(cb, None)
+        return titles
+
     def _execute_with_heartbeat(self, tool_name, params, user_confirmed=False):
         """Continuous-feedback rule: no silence >4s while busy. Speaks a short filler
         if a tool takes longer than that (page loads, slow lookups).
@@ -2161,10 +2786,31 @@ class VoiceController:
                 self.tts.speak_now("Still working on it.")
         timer = threading.Timer(4.0, filler)
         timer.start()
+        # Generic mid-task dialog detection (4.2): before this, only save_file's
+        # own hardcoded overwrite-prompt check existed — any OTHER unexpected
+        # dialog (a permission prompt, a crash reporter, an "unsaved changes"
+        # warning from a different action) was only ever discovered by accident,
+        # if the model happened to read_screen and reason about it. Snapshotting
+        # top-level windows before/after every tool call is cheap (EnumWindows,
+        # confirmed well under the read_screen costs already measured this
+        # session) and catches ANY new window generically, not per-dialog-type.
+        windows_before = self._list_top_level_window_titles()
         try:
-            return self.executor.execute(tool_name, params, user_confirmed=user_confirmed)
+            with log_elapsed(logger, f"tool_exec[{tool_name}]"):
+                result, status = self.executor.execute(tool_name, params, user_confirmed=user_confirmed)
         finally:
             timer.cancel()
+        if isinstance(result, dict):
+            windows_after = self._list_top_level_window_titles()
+            new_windows = windows_after - windows_before
+            if new_windows:
+                # Surfaced INSIDE the tool's own result dict, not a separate
+                # channel — this is exactly what already flows into the next
+                # planner round's "TOOL RESULTS:" context (see _act_observe's
+                # all_results/append_history), so no new plumbing is needed for
+                # the model to actually see it.
+                result["_new_window_appeared"] = sorted(new_windows)
+        return result, status
 
     def say(self, text: str, *, prefix_asset: str = None, dynamic_text: str = None, state_after: str = None):
         """Single gateway for everything Pulse says — every lane funnels through
@@ -2243,6 +2889,7 @@ class VoiceController:
             print(f"Typing echo hook unavailable (may need admin rights): {e}")
         threading.Thread(target=self._narration_loop, daemon=True).start()
         threading.Thread(target=self._screen_context_loop, daemon=True).start()
+        threading.Thread(target=self._mic_watchdog_loop, daemon=True).start()
         threading.Thread(target=self.run_onboarding, daemon=True).start()
         print("Voice controller started. Say 'pulse' to trigger.")
 

@@ -49,6 +49,21 @@ class TaskManager:
                 (json.dumps(history), task_id)
             )
             
+    def get_history(self, task_id: str) -> List[Dict[str, Any]]:
+        """Reads back what append_history has been durably persisting all along —
+        real evidence found 2026-08-03: this data was being written on every single
+        tool call but never once read back anywhere, so a parked-and-resumed task
+        always restarted from a totally blank slate (a fresh task_id via
+        process_text -> create_task, `all_results = []`), discarding everything it
+        had already genuinely done before pausing. Returns [] for an unknown id
+        rather than raising, matching append_history's own no-op-on-missing-row
+        behavior."""
+        conn = get_db()
+        row = conn.execute("SELECT history_json FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not row:
+            return []
+        return json.loads(row["history_json"])
+
     def get_pending_tasks(self) -> List[Dict[str, Any]]:
         conn = get_db()
         rows = conn.execute("SELECT * FROM tasks WHERE status = 'pending'").fetchall()

@@ -1,6 +1,7 @@
 import httpx
 import json
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,20 @@ class PlannerClient:
             # latency on the typical short one. Raised again to 768: added two
             # more required fields (missing_info, missing_info_required). Raised
             # again to 896: added two more (expectation_met, expected_effect).
-            "n_predict": 896,
+            # Raised again to 2048 (2026-08-03): real live failure -- a genuinely
+            # confusing round made the model's own "reasoning" field spiral into
+            # ~2800 chars of second-guessing, alone consuming almost the entire
+            # 896 budget before "plan"/"speak" were ever reached, so the JSON came
+            # back truncated mid-string ("I'm having trouble thinking right now"),
+            # even though the actual task had already succeeded. Per direction,
+            # the fix is real headroom, not a tight cap that cuts the model's own
+            # reasoning short -- 2048 comfortably covers a long reasoning trace
+            # (now capped at 2400 chars / ~600 tokens as a pure backstop, see
+            # registry.py) plus a normal-to-long plan/speak on top. Same as every
+            # previous raise: generation stops the moment the JSON is actually
+            # complete, so this only gives headroom for the rare longer response,
+            # never added latency on a typical short one.
+            "n_predict": 2048,
             # Was 0.1. Confirmed via research: Gemma 4 has a documented low-
             # temperature repetition attractor (github.com/google-deepmind/gemma
             # issue #647) — LOWER temperature makes it MORE likely to loop/repeat,
@@ -53,12 +67,24 @@ class PlannerClient:
         }
         
         try:
+            t0 = time.perf_counter()
             with httpx.Client() as client:
                 resp = client.post(self.url, json=payload, timeout=self.timeout)
                 resp.raise_for_status()
+                wall_ms = (time.perf_counter() - t0) * 1000
                 data = resp.json()
                 content = data.get("content", "")
                 logger.info(f"===GEMMA RAW RESPONSE=== {content}")
+                # llama-server already computes prompt-processing vs generation
+                # split server-side — logging it directly instead of re-deriving
+                # it is free and more accurate than any client-side estimate.
+                t = data.get("timings", {})
+                logger.info(
+                    f"TIMING [planner.round_trip] {wall_ms:.1f}ms "
+                    f"(server: prompt={t.get('prompt_ms', 0):.1f}ms/{t.get('prompt_n', '?')}tok "
+                    f"predicted={t.get('predicted_ms', 0):.1f}ms/{t.get('predicted_n', '?')}tok "
+                    f"{t.get('predicted_per_second', 0):.1f}tok/s)"
+                )
 
                 try:
                     return json.loads(content)
