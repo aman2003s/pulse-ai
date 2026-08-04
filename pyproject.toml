@@ -21,7 +21,8 @@ dependencies = [
     "pydantic",
     "httpx",
     "pypdf",
-    "winsdk"
+    "winsdk",
+    "fasttext-wheel"
 ]
 
 [tool.setuptools.packages.find]
