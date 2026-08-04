@@ -129,15 +129,89 @@ class CloseAppTool(Tool):
             return {"error": "No File Explorer windows are open."}
 
         exe = app_name + ".exe"
-        closed = 0
+        running = {}  # lowercased real process name -> list of psutil.Process
         for proc in psutil.process_iter(['name']):
-            if proc.info['name'] and proc.info['name'].lower() == exe:
+            n = proc.info['name']
+            if n:
+                running.setdefault(n.lower(), []).append(proc)
+
+        # Confirmed live (2026-07-31, "close calculator" failing) and independently
+        # documented (Microsoft's own PowerToys has an open issue about exactly
+        # this): modern UWP apps' real process name routinely doesn't match the
+        # friendly name + ".exe" guess — Calculator runs as CalculatorApp.exe, not
+        # calculator.exe, and which UWP apps get their own named process vs. run
+        # hosted under ApplicationFrameHost.exe varies app to app and Windows
+        # version to version, so no fixed alias table stays correct. Same
+        # rapidfuzz.process.extractOne pattern OpenAppTool already uses for the
+        # equivalent friendly-name-to-real-target problem, applied here against
+        # the REAL running process list instead of the app index (closing only
+        # cares about what's actually running right now). Exact match tried
+        # first — cheap, and guarantees this never behaves differently for a
+        # name that already matches exactly.
+        target_procs = running.get(exe)
+        if not target_procs:
+            match = process.extractOne(app_name, list(running.keys()), scorer=fuzz.QRatio)
+            if match and match[1] >= 60:
+                target_procs = running[match[0]]
+
+        # Real gap found in review (2026-08-01): this used to force-kill every
+        # non-Explorer app unconditionally (proc.terminate() == TerminateProcess,
+        # a hard kill) while Explorer's own windows get a graceful WM_CLOSE just
+        # above — meaning an app with unsaved work never got the chance to show
+        # its own "save changes?" prompt the way clicking its window's X would.
+        # Fixed the same way: WM_CLOSE every top-level window the process owns
+        # first, and give it a moment to exit on its own. If a save-prompt (or
+        # anything else) pops up, that's a genuinely new window — the EXISTING
+        # generic mid-task dialog detection (_execute_with_heartbeat's
+        # _new_window_appeared, prompt rule 18) already catches exactly this on
+        # the next round and hands it to the planner's own judgment (read it,
+        # narrate it, ask the user) rather than this tool guessing what to do
+        # with a hardcoded timeout-then-kill. Force-kill is now the fallback
+        # only for processes WM_CLOSE can't reach at all (no top-level window —
+        # a headless/background process), not the default for every app.
+        import win32gui, win32con, win32process
+
+        def _close_windows_for_pid(pid):
+            hwnds = []
+            def _enum(h, _):
+                if win32gui.IsWindowVisible(h):
+                    _, found_pid = win32process.GetWindowThreadProcessId(h)
+                    if found_pid == pid:
+                        hwnds.append(h)
+            win32gui.EnumWindows(_enum, None)
+            for h in hwnds:
+                win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
+            return hwnds
+
+        closed = 0
+        still_running = []
+        if target_procs:
+            for proc in target_procs:
                 try:
+                    hwnds = _close_windows_for_pid(proc.pid)
+                    if hwnds:
+                        try:
+                            proc.wait(timeout=1.5)
+                            closed += 1
+                            continue
+                        except psutil.TimeoutExpired:
+                            # Didn't exit after a graceful request — likely showing
+                            # its own dialog (unsaved changes, etc.) and waiting on
+                            # the user. Leave it running rather than killing it out
+                            # from under that dialog; the new-window detection above
+                            # surfaces it for the planner to actually look at.
+                            still_running.append(proc.pid)
+                            continue
+                    # No visible top-level window to close gracefully — a
+                    # background/headless process WM_CLOSE can't reach.
                     proc.terminate()
                     closed += 1
-                except:
+                except Exception:
                     pass
 
+        if still_running:
+            return {"success": True, "closed_processes": closed,
+                     "note": "Close requested — one or more windows are still open, possibly waiting on an unsaved-changes prompt. Check the screen before assuming it's done."}
         if closed > 0:
             return {"success": True, "closed_processes": closed}
         return {"error": f"No running process found matching '{exe}'."}

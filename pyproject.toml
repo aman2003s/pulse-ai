@@ -19,7 +19,9 @@ dependencies = [
     "faster-whisper",
     "websockets",
     "pydantic",
-    "httpx"
+    "httpx",
+    "pypdf",
+    "winsdk"
 ]
 
 [tool.setuptools.packages.find]

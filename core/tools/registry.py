@@ -66,7 +66,25 @@ class ToolRegistry:
                 # like "I already tried this twice" before committing to plan/speak.
                 "reasoning": {
                     "type": "string",
-                    "description": "Brief internal reasoning before deciding — what you observe from the latest results, whether you're repeating yourself, and why this next step is the right one. Not shown to the user."
+                    # A maxLength of 2400 was tried here (2026-08-04) and broke EVERY
+                    # planner call with HTTP 400 "Failed to initialize samplers: failed
+                    # to parse grammar" -- root-caused, not guessed: this is a known,
+                    # open llama.cpp bug (github.com/ggml-org/llama.cpp issues #25746 /
+                    # #25923) -- json-schema-to-grammar's repetition cap for a string
+                    # maxLength is only applied at the top level; any maxLength >= 2000
+                    # (GRAMMAR_MAX_REPETITION_THRESHOLD, exactly) produces invalid GBNF
+                    # once combined with a schema this complex, and because every tool
+                    # call compiles into ONE combined grammar, that one bad field broke
+                    # every single request, not just long-reasoning ones. No merged fix
+                    # exists upstream as of this build (10068/571d0d540). Confirmed the
+                    # exact boundary empirically against this real schema on a
+                    # standalone llama-server: maxLength=1999 -> 200 OK, 2000 -> 400.
+                    # 1900 stays safely under that with margin, and is still far more
+                    # headroom than a normal round's reasoning ever needs -- a pure
+                    # backstop against genuinely unbounded runaway generation, not the
+                    # primary fix (that's n_predict headroom, see client.py).
+                    "maxLength": 1900,
+                    "description": "Internal reasoning before deciding — what you observe from the latest results, whether you're repeating yourself, and why this next step is the right one. Not shown to the user. Use the space you genuinely need, but don't spiral into repeating the same uncertainty over and over — once you've reasoned through it, commit to a decision."
                 },
                 # Forces an explicit action-effect check EVERY round, not just
                 # after code notices a pattern (loop detection only catches
@@ -139,6 +157,48 @@ class ToolRegistry:
                 "task_step_done": {"type": "boolean"}
             },
             "required": ["reasoning", "expectation_met", "missing_info", "missing_info_required", "speak", "plan", "expected_effect", "needs_confirmation", "task_step_done"]
+        }
+
+    def get_qa_schema(self) -> dict:
+        """Deliberately minimal schema for the Q&A fast path (5.1) — reasoning
+        + speak + an optional single tool call, none of the multi-step-
+        task bookkeeping fields (task_list/expected_effect/missing_info/
+        task_step_done/etc.) a direct question never needs. Fewer required
+        fields means less minimum generation length before the JSON
+        completes — this session's own timing instrumentation confirmed
+        generation length (not prompt processing, already cache-warm) is
+        what actually dominates round time, so this is a direct lever on
+        that, not just a smaller prompt. Tool choices (5.3): web_search for
+        real-world facts, read_screen/look_at_screen for "summarize/describe
+        what's on screen" style requests, search_file/read_pdf for "summarize/
+        what does this PDF say" requests (search_file first if only given a
+        name, not a path) — same lean lane, no task_list machinery needed for
+        any of them."""
+        return {
+            "type": "object",
+            "properties": {
+                "reasoning": {
+                    "type": "string",
+                    "description": "Brief: do you already know this confidently, or does it need a live web_search / a look at the screen? Not shown to the user."
+                },
+                "speak": {
+                    "type": "string",
+                    "description": "The natural-language answer (1-3 sentences), or what you're about to check if calling a tool this round."
+                },
+                "plan": {
+                    "type": "array",
+                    "maxItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool": {"type": "string", "enum": ["web_search", "read_screen", "look_at_screen", "search_file", "read_pdf"]},
+                            "params": {"type": "object"}
+                        },
+                        "required": ["tool", "params"]
+                    }
+                }
+            },
+            "required": ["reasoning", "speak", "plan"]
         }
 
 

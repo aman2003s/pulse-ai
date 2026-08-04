@@ -1,6 +1,10 @@
+import logging
 from typing import Dict, Any, ClassVar
 from core.tools.registry import registry, Tool
 from core.db import get_db
+from core.utils.timing import log_elapsed
+
+logger = logging.getLogger(__name__)
 
 class ChangeSettingsTool(Tool):
     name: str = "change_settings"
@@ -39,14 +43,15 @@ class DescribeScreenTool(Tool):
 
     def execute(self, params: Dict[str, Any]) -> Dict[str, Any]:
         import win32gui
-        focused = win32gui.GetWindowText(win32gui.GetForegroundWindow())
-        titles = []
-        def cb(h, _):
-            if win32gui.IsWindowVisible(h):
-                t = win32gui.GetWindowText(h)
-                if t and t not in self.IGNORE and t != focused and t not in titles:
-                    titles.append(t)
-        win32gui.EnumWindows(cb, None)
+        with log_elapsed(logger, "describe_screen.total"):
+            focused = win32gui.GetWindowText(win32gui.GetForegroundWindow())
+            titles = []
+            def cb(h, _):
+                if win32gui.IsWindowVisible(h):
+                    t = win32gui.GetWindowText(h)
+                    if t and t not in self.IGNORE and t != focused and t not in titles:
+                        titles.append(t)
+            win32gui.EnumWindows(cb, None)
         return {"success": True, "focused_window": focused or "nothing focused", "open_windows": titles[:10]}
 
 
@@ -68,7 +73,124 @@ def set_planner_port(port: int):
     _PLANNER_PORT = port
 
 
-def _control_view_children(c):
+def _build_cache_request():
+    # Researched: a plain tree walk does 1 COM round-trip to navigate to each
+    # node PLUS one more per live property read on it (Name, ControlType,
+    # BoundingRectangle — 3 separate CurrentXxx COM calls in the property
+    # implementations below), so 4 round-trips per node. A CacheRequest
+    # pre-declares which properties to fetch, and the TreeWalker's *BuildCache
+    # navigation methods populate them in the SAME call that does the
+    # navigation — 1 round-trip per node instead of 4. This is the mechanism
+    # Microsoft's own UI Automation docs recommend for exactly this "many
+    # small property fetches during a tree walk" cost, and it's the same
+    # cross-process-COM-call reduction NVDA/JAWS-class tools rely on. Returns
+    # None if anything about building it fails, so the walk falls back to the
+    # old per-property live-fetch behavior rather than breaking.
+    try:
+        import comtypes.gen.UIAutomationClient as _uiac
+        from uiautomation import uiautomation as _auto_impl
+        iuia = _auto_impl._AutomationClient.instance().IUIAutomation
+        cr = iuia.CreateCacheRequest()
+        cr.AddProperty(_uiac.UIA_NamePropertyId)
+        cr.AddProperty(_uiac.UIA_ControlTypePropertyId)
+        cr.AddProperty(_uiac.UIA_BoundingRectanglePropertyId)
+        return cr
+    except Exception:
+        return None
+
+
+def _elem_name(ch):
+    # Cached* raises ("The parameter is incorrect") on any element that
+    # wasn't fetched via a CacheRequest — confirmed live — so this falls
+    # back to the plain live property rather than losing the value whenever
+    # caching wasn't available for this node (e.g. the GetChildren() fallback
+    # path in _control_view_children).
+    try:
+        return ch.Element.CachedName or ''
+    except Exception:
+        return ch.Name
+
+
+def _elem_type_name(ch):
+    try:
+        import uiautomation as _auto
+        return _auto.ControlTypeNames[ch.Element.CachedControlType]
+    except Exception:
+        return ch.ControlTypeName
+
+
+def _elem_rect(ch):
+    try:
+        import uiautomation as _auto
+        r = ch.Element.CachedBoundingRectangle
+        return _auto.Rect(r.left, r.top, r.right, r.bottom)
+    except Exception:
+        return ch.BoundingRectangle
+
+
+# Confirmed real gap (2026-08-01): a Document/Edit control was always listed
+# as a fill-targetable ITEM ("[1] Document: Text editor") but its actual
+# CONTENT was never extracted anywhere — read_screen's visible_text only
+# ever came from literal "Text"-typed static labels, so "summarize this
+# page" for a text editor's own document body had nothing real to work
+# with. ValuePattern.Value covers plain Edit controls; TextPattern (Word,
+# some richer document controls) as fallback. Capped at 4000 chars — unlike
+# the deliberately-uncapped controls/texts lists above (a rich UI's normal
+# size is cheap; an arbitrarily long user DOCUMENT is a different scale of
+# problem, worth a real bound), matching a Q&A-style summary's actual needs
+# rather than dumping an entire novel into one round's context.
+_DOCUMENT_CONTENT_CAP = 4000
+
+
+def _truncate_note(text: str, exact_total: int = None) -> str:
+    """Real gap found in review (2026-08-01): the document-content cap below
+    was silent — a long document got cut at 4000 chars with no signal to the
+    model that anything was missing, so "summarize this" could confidently
+    describe a summary as complete when it only ever saw the first page or so.
+    Every other place in this file that deliberately doesn't cap (the controls/
+    text list) explains why in its own comment; this one gets the same
+    honesty, the other direction — say so when it DOES truncate. `exact_total`
+    is the real full length when known (ValuePattern gives us the whole string
+    up front); when unknown (TextPattern's GetText only proves "at least this
+    much", not the true total, without a second, potentially expensive full-
+    document fetch) the note says so honestly rather than reporting a fake
+    precise count."""
+    if exact_total is not None:
+        return text + f"\n[...truncated — showing the first {_DOCUMENT_CONTENT_CAP} of {exact_total} characters]"
+    return text + f"\n[...truncated — showing the first {_DOCUMENT_CONTENT_CAP} characters, more content follows]"
+
+def _elem_content(ch, control_type_name):
+    if control_type_name not in ("Edit", "Document"):
+        return ""
+    import uiautomation as _auto
+    try:
+        vp = ch.GetPattern(_auto.PatternId.ValuePattern)
+        if vp:
+            val = vp.Value
+            if val and val.strip():
+                if len(val) > _DOCUMENT_CONTENT_CAP:
+                    return _truncate_note(val[:_DOCUMENT_CONTENT_CAP], exact_total=len(val))
+                return val
+    except Exception:
+        pass
+    try:
+        tp = ch.GetPattern(_auto.PatternId.TextPattern)
+        if tp:
+            # GetText's own cap arg only bounds what's fetched, not what
+            # exists — fetch one extra char over the cap so we can tell
+            # "exactly at the cap" apart from "there's more after it" without
+            # a second full-document call just to get a real total length.
+            txt = tp.DocumentRange.GetText(_DOCUMENT_CONTENT_CAP + 1)
+            if txt and txt.strip():
+                if len(txt) > _DOCUMENT_CONTENT_CAP:
+                    return _truncate_note(txt[:_DOCUMENT_CONTENT_CAP])
+                return txt
+    except Exception:
+        pass
+    return ""
+
+
+def _control_view_children(c, cache_request=None):
     # Researched (2026-07-28): the `uiautomation` package walks the RAW,
     # completely unfiltered UIA tree by default (its ViewWalker is hardcoded
     # to IUIAutomation.RawViewWalker — confirmed by reading the package
@@ -93,10 +215,16 @@ def _control_view_children(c):
         import uiautomation as _auto
         walker = _auto_impl._AutomationClient.instance().IUIAutomation.ControlViewWalker
         children = []
-        elem = walker.GetFirstChildElement(c.Element)
-        while elem:
-            children.append(_auto.Control.CreateControlFromElement(elem))
-            elem = walker.GetNextSiblingElement(elem)
+        if cache_request is not None:
+            elem = walker.GetFirstChildElementBuildCache(c.Element, cache_request)
+            while elem:
+                children.append(_auto.Control.CreateControlFromElement(elem))
+                elem = walker.GetNextSiblingElementBuildCache(elem, cache_request)
+        else:
+            elem = walker.GetFirstChildElement(c.Element)
+            while elem:
+                children.append(_auto.Control.CreateControlFromElement(elem))
+                elem = walker.GetNextSiblingElement(elem)
         return children
     except Exception:
         return c.GetChildren()
@@ -111,6 +239,7 @@ def _walk_screen_tree(top):
         win_rect = top.BoundingRectangle
     except Exception:
         win_rect = None
+    cache_request = _build_cache_request()
 
     def region_of(ch):
         # Researched (2026-07-27): a flat accessibility-tree text list has
@@ -138,7 +267,7 @@ def _walk_screen_tree(top):
         try:
             if win_rect is None or win_rect.width() <= 0 or win_rect.height() <= 0:
                 return ""
-            r = ch.BoundingRectangle
+            r = _elem_rect(ch)
             if r.width() <= 0 or r.height() <= 0:
                 return ""
             rel_x = (r.xcenter() - win_rect.left) / win_rect.width()
@@ -158,10 +287,10 @@ def _walk_screen_tree(top):
         # round budgets elsewhere: limit runaway repetition, not normal work.
         if depth > 40 or len(items) > 300:
             return
-        for ch in _control_view_children(c):
+        for ch in _control_view_children(c, cache_request):
             try:
-                name = (ch.Name or "").strip()
-                t = ch.ControlTypeName.replace("Control", "")
+                name = (_elem_name(ch) or "").strip()
+                t = _elem_type_name(ch).replace("Control", "")
                 # Edit/Document are always fill-targetable even with no name — an empty
                 # text-entry area (e.g. Notepad's main content, which reports as
                 # "Document" not "Edit") usually has no accessible label at all, but
@@ -170,13 +299,17 @@ def _walk_screen_tree(top):
                     label = name if name else f"(unlabeled {t.lower()})"
                     elements.append(ch)
                     items.append(f"[{len(elements)}] {t}: {label[:80]}{region_of(ch)}")
+                    content = _elem_content(ch, t)
+                    if content:
+                        texts.append(f"[content of {t.lower()} [{len(elements)}]]: {content}")
                 elif t == "Text" and name and len(name) > 1:
                     texts.append(name[:300])
                 walk(ch, depth + 1)
             except Exception:
                 continue
 
-    walk(top, 0)
+    with log_elapsed(logger, "read_screen.tree_walk"):
+        walk(top, 0)
     return items, texts, elements
 
 
@@ -198,6 +331,7 @@ class ReadScreenTool(Tool):
         import uiautomation as auto
         import win32gui
         import time
+        _t0 = time.perf_counter()
         global _LAST_ELEMENTS
         # Self-healing retry for a confirmed transient state: right after
         # open_app, a heavy app (Word) can hold real OS-level foreground focus
@@ -303,6 +437,7 @@ class ReadScreenTool(Tool):
                 "may render its own custom UI. Use look_at_screen to see it visually instead "
                 "of retrying read_screen."
             )
+        logger.info(f"TIMING [read_screen.total] {(time.perf_counter() - _t0) * 1000:.1f}ms ({len(items)} controls, {len(texts)} text items)")
         return result
 
 
@@ -426,6 +561,54 @@ class ClickAtPositionTool(Tool):
             return {"error": str(e)}
 
 
+def _click_via_pattern_ladder(el):
+    # Real click (tried by the caller before this) fails for elements with no
+    # valid clickable point (off-screen, zero-size, obscured) — this is the
+    # fallback ladder for that case, tried in order until one both EXISTS on
+    # this element and completes without raising. Each pattern only applies
+    # to certain control types (e.g. TogglePattern to checkboxes, Selection-
+    # ItemPattern to list/tab items) — GetPattern() returns None rather than
+    # raising when unsupported, so every tier is a plain "skip if None, try
+    # the next" rather than needing a per-control-type dispatch. Order
+    # matches Stage 4's original design: InvokePattern (buttons/links) ->
+    # TogglePattern (checkboxes/switches) -> SelectionItemPattern (list/tab
+    # items) -> ExpandCollapsePattern (menus/expanders) -> LegacyIAccessible.
+    # DoDefaultAction() (last resort — works for controls with no modern UIA
+    # pattern at all, common in older Win32 apps). Raises the LAST exception
+    # seen (or a clear "nothing applied" error) if every tier is exhausted,
+    # so the caller's existing `except Exception as e: return {"error": ...}`
+    # still reports something actionable rather than silently doing nothing.
+    import uiautomation as auto
+    last_error = None
+    attempts = [
+        ("InvokePattern", lambda p: p.Invoke()),
+        ("TogglePattern", lambda p: p.Toggle()),
+        ("SelectionItemPattern", lambda p: p.Select()),
+        ("ExpandCollapsePattern", lambda p: p.Expand()),
+    ]
+    for pattern_name, call in attempts:
+        try:
+            pattern = el.GetPattern(getattr(auto.PatternId, pattern_name))
+        except Exception as e:
+            last_error = e
+            continue
+        if not pattern:
+            continue
+        try:
+            call(pattern)
+            return
+        except Exception as e:
+            last_error = e
+    try:
+        legacy = el.GetLegacyIAccessiblePattern()
+        if legacy:
+            legacy.DoDefaultAction()
+            return
+    except Exception as e:
+        last_error = e
+    raise last_error or Exception("No click pattern (Invoke/Toggle/SelectionItem/ExpandCollapse/LegacyIAccessible) applied to this element.")
+
+
 class ClickElementTool(Tool):
     name: str = "click_element"
     description: str = "Clicks a numbered element from the most recent read_screen result (use the [N] number shown there — buttons, links, tabs, list items). Always call read_screen first if you don't already have current numbers."
@@ -444,6 +627,29 @@ class ClickElementTool(Tool):
         el = _LAST_ELEMENTS[idx]
         try:
             name = el.Name
+            # Stale-element guard: the screen may genuinely have changed since
+            # the read_screen that produced this index (a dialog closed, the
+            # window navigated) — clicking blind at a location that's no
+            # longer valid either does nothing or, worse, hits whatever now
+            # happens to be at those old screen coordinates. Live property
+            # reads (not cached), so this reflects the CURRENT state, not
+            # what read_screen saw when the index was assigned.
+            if el.Element.CurrentIsOffscreen:
+                return {"error": f"'{name}' is no longer visible on screen — read the screen again before clicking."}
+            rect = el.Element.CurrentBoundingRectangle
+            if rect.right <= rect.left or rect.bottom <= rect.top:
+                return {"error": f"'{name}' no longer has a valid on-screen position — read the screen again before clicking."}
+            # Verify the element's own top-level window is still the one in
+            # front — a click aimed at a background window either does
+            # nothing or lands on whatever app the user switched to instead.
+            # A check, not a force: forcing foreground belongs exclusively at
+            # _execute_with_heartbeat's one authorized call site (controller.py)
+            # per its own "on top only when actually in use" design — this
+            # tool reports the mismatch honestly rather than silently forcing it.
+            import win32gui
+            top = el.GetTopLevelControl()
+            if top and top.NativeWindowHandle and top.NativeWindowHandle != win32gui.GetForegroundWindow():
+                return {"error": f"'{name}''s window isn't in front anymore — that app may have lost focus. Try again."}
             el.SetFocus()
             # Prefer a REAL simulated mouse click over InvokePattern.Invoke() —
             # confirmed live: Invoke() can report success without the app
@@ -456,36 +662,102 @@ class ClickElementTool(Tool):
             # unreliability. Only fall back to Invoke if a real click isn't
             # possible (element has no valid bounding rectangle — off-screen,
             # zero-size, obscured).
+            # Capture toggle state before, if this control has one — the
+            # cheapest real "did the click register" signal available
+            # without a full read_screen diff on every single click (which
+            # would undo the UIA CacheRequest batching latency work for a
+            # confirmation most clicks don't need). Not a substitute for the
+            # planner's own round-level expectation_met check, just a
+            # same-call sanity signal for the common checkbox/toggle case.
+            import uiautomation as auto
+            toggle_before = None
+            try:
+                tp = el.GetPattern(auto.PatternId.TogglePattern)
+                if tp:
+                    toggle_before = tp.ToggleState
+            except Exception:
+                pass
+
             try:
                 el.Click(simulateMove=False)
             except Exception:
-                invoke = el.GetInvokePattern()
-                if not invoke:
-                    raise
-                invoke.Invoke()
-            return {"success": True, "message": f"Clicked {name}"}
+                _click_via_pattern_ladder(el)
+
+            result = {"success": True, "message": f"Clicked {name}"}
+            if toggle_before is not None:
+                try:
+                    tp = el.GetPattern(auto.PatternId.TogglePattern)
+                    toggle_after = tp.ToggleState if tp else None
+                    if toggle_after == toggle_before:
+                        result["warning"] = "Toggle state didn't change — the click may not have registered."
+                    else:
+                        result["toggle_state"] = {auto.ToggleState.On: "on", auto.ToggleState.Off: "off",
+                                                   auto.ToggleState.Indeterminate: "indeterminate"}.get(toggle_after, "unknown")
+                except Exception:
+                    pass
+            elif el.Element.CurrentIsOffscreen:
+                # A visible, non-toggle control that's now offscreen right
+                # after being clicked is a real, cheap "something happened"
+                # signal (a dialog closed, a navigation occurred) — worth
+                # surfacing, not worth chasing further with an extra read.
+                result["note"] = "Element is no longer visible after the click — the screen likely changed."
+            return result
         except Exception as e:
             return {"error": str(e)}
 
 
 class FillElementTool(Tool):
     name: str = "fill_element"
-    description: str = "Types text into a numbered field from the most recent read_screen result. Set submit=true to press Enter afterward (e.g. for a search box)."
+    description: str = (
+        "Types text into a numbered field from the most recent read_screen result. Set submit=true to "
+        "press Enter afterward (e.g. for a search box). By default this REPLACES the field's entire "
+        "content — set append=true when the user asked to ADD to something already written (e.g. "
+        "'add my phone number to that note') rather than start fresh; append preserves whatever is "
+        "already there instead of wiping it out."
+    )
     input_schema: Dict[str, Any] = {
         "type": "object",
         "properties": {
             "index": {"type": "integer", "description": "The [N] number from read_screen"},
             "value": {"type": "string"},
-            "submit": {"type": "boolean", "description": "Press Enter after typing (e.g. to submit a search)"}
+            "submit": {"type": "boolean", "description": "Press Enter after typing (e.g. to submit a search)"},
+            "append": {"type": "boolean", "description": "Add to the field's existing content instead of replacing it. Use when adding to something already written, not starting fresh."}
         },
         "required": ["index", "value"]
     }
     output_schema: Dict[str, Any] = {"type": "object"}
-    permission_level: str = "safe"
+    permission_level: str = "confirm"  # base default; needs_confirm() below narrows this to the one real risk
+
+    def needs_confirm(self, params: Dict[str, Any]) -> bool:
+        """Real, code-level guarantee (2026-08-01, direct requirement — a prompt
+        instruction telling the model not to retype existing content is NOT a
+        guarantee, since the model can still ignore it): if this call would
+        REPLACE (not append) a field that already holds substantial content,
+        require an actual human "yes" before it happens — this makes a
+        redundant/hallucinated document rewrite structurally impossible without
+        real confirmation, not just discouraged. Scoped to substantial content
+        (40+ chars, comfortably past "a word or two") specifically so this
+        doesn't add friction to completely normal actions like typing a new
+        query into a search box that still has the last one in it — same
+        SAFE_KEYS-style narrowing SendKeysTool already uses for its own
+        permission_level="confirm" base."""
+        if params.get("append"):
+            return False
+        idx = params.get("index", 0) - 1
+        if idx < 0 or idx >= len(_LAST_ELEMENTS):
+            return False
+        try:
+            el = _LAST_ELEMENTS[idx]
+            vp = el.GetValuePattern()
+            current = (vp.Value or "") if vp else ""
+            return len(current.strip()) > 40
+        except Exception:
+            return False
 
     def execute(self, params: Dict[str, Any]) -> Dict[str, Any]:
         idx = params.get("index", 0) - 1
         value = params.get("value", "")
+        append = params.get("append", False)
         if idx < 0 or idx >= len(_LAST_ELEMENTS):
             return {"error": "That element number isn't available anymore. Read the screen again first."}
         el = _LAST_ELEMENTS[idx]
@@ -494,14 +766,29 @@ class FillElementTool(Tool):
             el.SetFocus()
             val_pattern = el.GetValuePattern()
             if val_pattern:
-                val_pattern.SetValue(value)
+                if append:
+                    # Real gap found in review (2026-08-01): ValuePattern.SetValue
+                    # always fully replaces a control's content — there's no
+                    # native "insert" in UIA's Value pattern. Read the current
+                    # value first and set the concatenation, so "add X to that"
+                    # doesn't silently wipe out everything already there.
+                    current = val_pattern.Value or ""
+                    val_pattern.SetValue(current + value)
+                else:
+                    val_pattern.SetValue(value)
             else:
                 import keyboard as kb
+                if append:
+                    # No ValuePattern to read/rewrite — move to the end of the
+                    # field first so typing adds on rather than landing wherever
+                    # the cursor happens to be (which could overwrite a
+                    # selection or land mid-text).
+                    kb.send("ctrl+end")
                 kb.write(value)
             if params.get("submit"):
                 import keyboard as kb
                 kb.send("enter")
-            return {"success": True, "message": f"Typed into {name}"}
+            return {"success": True, "message": f"{'Added to' if append else 'Typed into'} {name}"}
         except Exception as e:
             return {"error": str(e)}
 

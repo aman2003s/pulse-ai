@@ -14,7 +14,7 @@ from core.paths import models_dir
 warnings.filterwarnings("ignore", category=UserWarning)
 
 class CapturePipeline:
-    def __init__(self, sample_rate=16000):
+    def __init__(self, sample_rate=16000, is_speaking_fn=None):
         self.sample_rate = sample_rate
         print("Loading Silero VAD...")
         self.model, self.utils = torch.hub.load(
@@ -27,6 +27,18 @@ class CapturePipeline:
         legacy_ack = os.path.join(models_dir(), 'ack.wav')
         self.earcon_path = assets_ack if os.path.exists(assets_ack) else legacy_ack
         self._abort = threading.Event()
+        # AEC-lite: same pattern already proven for WakeListener's own self-echo
+        # guard (is_speaking_fn combining "still playing" + a short settle window
+        # after) — reused here because it's the SAME underlying problem, just for
+        # the "listen for a reply" capture instead of wake-word detection. Local
+        # voice-assistant projects (ESPHome, Rhasspy/Home Assistant satellites)
+        # converge on this exact pattern for exactly this reason: no real signal-
+        # level echo cancellation, just mute-during-and-briefly-after playback,
+        # since there's no separate reference/loopback signal available to do
+        # real AEC against. Confirmed live (2026-07-31) this gap is real: an
+        # exact prior TTS line of Pulse's own showed up transcribed as a "user
+        # answer" to an unrelated pending question.
+        self.is_speaking_fn = is_speaking_fn or (lambda: False)
 
     def cancel_capture(self):
         """Aborts an in-progress capture_until_silence() call immediately. Fixes the bug
@@ -36,6 +48,14 @@ class CapturePipeline:
         sd.stop()
 
     def play_earcon(self):
+        # Never start the "now listening" chime — and by extension never start
+        # capturing — while Pulse is still speaking or within the brief settle
+        # window right after (acoustic energy can still be resonating in the
+        # room even once the digital signal stops). Bounded so a stuck flag
+        # can't hang this forever.
+        settle_deadline = time.time() + 5.0
+        while self.is_speaking_fn() and time.time() < settle_deadline:
+            time.sleep(0.05)
         # Rapidly switching output sample rate (Kokoro plays at 24kHz, this at 16kHz)
         # can glitch some Windows audio drivers, especially back-to-back in the wake-word
         # training loop. sd.stop() + one retry makes it reliable.

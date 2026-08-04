@@ -55,9 +55,11 @@ class PulseOrchestrator:
                 fetch_models.MODELS_DIR = MODELS_DIR
                 fetch_models.GEMMA_TARGET = MODEL_PATH
                 fetch_models.MMPROJ_TARGET = MMPROJ_PATH
+                fetch_models.MTP_TARGET = os.path.join(MODELS_DIR, 'mtp-gemma-4-E4B-it.gguf')
                 os.makedirs(MODELS_DIR, exist_ok=True)
                 fetch_models.setup_gemma()
                 fetch_models.setup_mmproj()
+                fetch_models.setup_mtp()
                 fetch_models.fetch_llama_server()
             except Exception:
                 logger.exception("Automatic model fetch failed.")
@@ -85,8 +87,28 @@ class PulseOrchestrator:
         # machine), a hardcoded "-ngl 99" would leave Pulse unable to start at all
         # on those machines. Trying 0 (CPU) after 99 (GPU) fails costs a few seconds
         # on GPU-less machines and nothing extra when GPU works on the first try.
+        # GPU-only speed optimizations (2026-07-31, see FLOW_PLAN.md for the full
+        # investigation): -fa on frees ~1GB+ VRAM by itself (measured 5.6-5.7GB ->
+        # 4.6GB used), which is what lets MTP speculative decoding actually help
+        # instead of hurt — MTP alone against the unoptimized baseline was SLOWER
+        # (VRAM-contention-bound, near-zero headroom beforehand). Verified through
+        # two clean, unambiguous real multi-step tasks via the live app (not just
+        # isolated token-throughput benchmarks, which overstated the gain because
+        # they reuse the exact same prompt every call — a best-case cache hit real
+        # usage doesn't get): ~19% faster end-to-end (111.9s -> 90.7s for the same
+        # "open Notepad, write X, save as Y.txt" goal), both runs verified as a
+        # correct file on disk, not just narration claiming success. Only applied
+        # to the GPU path — the CPU fallback below is untouched.
+        mtp_draft = os.path.join(MODELS_DIR, "mtp-gemma-4-E4B-it.gguf")
         for ngl in ("99", "0"):
             mode = "GPU" if ngl != "0" else "CPU-only"
+            perf_args = []
+            if ngl == "99":
+                perf_args = ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0"]
+                if os.path.exists(mtp_draft):
+                    perf_args += ["--spec-draft-model", mtp_draft, "--spec-type", "draft-mtp", "--spec-draft-n-max", "4"]
+                else:
+                    logger.warning("MTP drafter (mtp-gemma-4-E4B-it.gguf) not found — running without speculative decoding.")
             for port in (8081, 8082, 8083):  # M7.2: fall back if port is taken
                 logger.info(f"Starting llama-server on port {port} ({mode})...")
                 self.llama_process = subprocess.Popen(
@@ -108,7 +130,7 @@ class PulseOrchestrator:
                     # needs, working against "fast" on the project's stated 8GB-RAM
                     # target. Raise further only if you have concrete evidence a task is
                     # actually filling this.
-                    [SERVER_EXE, "-m", MODEL_PATH, "--port", str(port), "-c", "32768", "-ngl", ngl, "--parallel", "1"] + mm_args,
+                    [SERVER_EXE, "-m", MODEL_PATH, "--port", str(port), "-c", "32768", "-ngl", ngl, "--parallel", "1"] + perf_args + mm_args,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL
                 )

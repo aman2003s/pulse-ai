@@ -39,6 +39,11 @@ function setState(state) {
   pill.classList.remove("faded");
   if (state === "idle") {
     fadeTimer = setTimeout(() => pill.classList.add("faded"), 6000);
+    // Confirmed real leak: this function never touched detailLine, so the last
+    // transcript/tool-params text stayed visible indefinitely after a task
+    // finished — only the one-time ws.onopen handler ever cleared it, so the UI
+    // could look like it was still on the previous action even once idle.
+    detailLine.textContent = "";
   }
 }
 
